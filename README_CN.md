@@ -35,7 +35,7 @@
 
 🏃‍♂️ [**执行器 (Runner)**](./docs/runner_and_pipeline_cn.md) **|**
 📜 [**配置文件 (Config)**](./docs/config_design_cn.md) **|**
-📜 [**基线模型 (Baselines)**](./src/basicts/models/)
+📜 [**基线模型 (Baselines)**](basicts/models/)
 
 </div>
 
@@ -43,7 +43,7 @@ BasicTS (**Basic** **T**ime **S**eries) 是一个面向时间序列分析的基�
 
 ## 📢 最新动态
 
-🎉 **更新（2025年10月）**：BasicTS 内置支持[**选择学习(NeurIPS'25)**](http://arxiv.org/abs/2510.25207)，一种有效缓解过拟合，增加模型性能和泛化性的训练策略。用户可以从[回调模块](./src/basicts/runners/callback/selective_learning.py)中导入并直接使用。[使用说明](https://github.com/GestaltCogTeam/selective-learning)
+🎉 **更新（2025年10月）**：BasicTS 内置支持[**选择学习(NeurIPS'25)**](http://arxiv.org/abs/2510.25207)，一种有效缓解过拟合，增加模型性能和泛化性的训练策略。用户可以从[回调模块](basicts/runners/callback/selective_learning.py)中导入并直接使用。[使用说明](https://github.com/GestaltCogTeam/selective-learning)
 
 🎉 **更新（2025年10月）：BasicTS 1.0版本发布了！新特性：**
   - 🚀 **三行代码，快速上手**​​：pip install 安装，极简 API 设计，快速实现模型训练与评估。

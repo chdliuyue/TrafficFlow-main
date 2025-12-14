@@ -34,7 +34,7 @@
 📉 [**Metrics**](./docs/metrics_design.md) **|**
 🏃‍♂️ [**Runner**](./docs/runner_and_pipeline.md) **|**
 📜 [**Config**](./docs/config_design.md) **|**
-📜 [**Baselines**](./src/basicts/models/)
+📜 [**Baselines**](basicts/models/)
 
 </div>
 
@@ -42,7 +42,7 @@ BasicTS (**Basic** **T**ime **S**eries) is a benchmark library and toolkit desig
 
 ## 📢 Latest Updates
 
-🎉 **Update (Oct 2025)**: BasicTS now has built-in support for [**Selective Learning (NeurIPS'25)**](http://arxiv.org/abs/2510.25207), an effective training strategy to mitigate overfitting and enhance model performance and generalization. Users can import and use it directly from the [callback module](./src/basicts/runners/callback/selective_learning.py). [Usage Guide](https://github.com/GestaltCogTeam/selective-learning)
+🎉 **Update (Oct 2025)**: BasicTS now has built-in support for [**Selective Learning (NeurIPS'25)**](http://arxiv.org/abs/2510.25207), an effective training strategy to mitigate overfitting and enhance model performance and generalization. Users can import and use it directly from the [callback module](basicts/runners/callback/selective_learning.py). [Usage Guide](https://github.com/GestaltCogTeam/selective-learning)
 
 🎉 **Update (Oct 2025): BasicTS version 1.0 is released! New Features:**
   - 🚀 **Quick Start with Three Lines of Code**: Install via pip, minimal API design for rapid model training and evaluation.
