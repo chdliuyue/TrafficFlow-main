@@ -1,11 +1,11 @@
 from basicts import BasicTSLauncher
 from basicts.configs import BasicTSForecastingConfig
-from basicts.models.Crossformer import Crossformer, CrossformerConfig
+from basicts.models.TimeXer import TimeXer, TimeXerConfig
 
 
 def main():
 
-    model_config = CrossformerConfig(
+    model_config = TimeXerConfig(
         input_len=12,
         output_len=12,
         num_features=358,
@@ -13,7 +13,7 @@ def main():
 
 
     BasicTSLauncher.launch_training(BasicTSForecastingConfig(
-        model=Crossformer,
+        model=TimeXer,
         input_len=12,
         output_len=12,
         model_config=model_config,
