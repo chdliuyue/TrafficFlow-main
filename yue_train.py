@@ -1,15 +1,19 @@
 from basicts import BasicTSLauncher
 from basicts.configs import BasicTSForecastingConfig
-from basicts.models.DLinear import DLinear, DLinearConfig
-from basicts.models.Autoformer import Autoformer, AutoformerConfig
+from basicts.models.Crossformer import Crossformer, CrossformerConfig
 
 
 def main():
 
-    model_config = AutoformerConfig(label_len=6, num_features=358)
+    model_config = CrossformerConfig(
+        input_len=12,
+        output_len=12,
+        num_features=358,
+    )
+
 
     BasicTSLauncher.launch_training(BasicTSForecastingConfig(
-        model=Autoformer,
+        model=Crossformer,
         input_len=12,
         output_len=12,
         model_config=model_config,
