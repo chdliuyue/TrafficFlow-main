@@ -190,3 +190,5 @@ cython_debug/
 # keep datasets in test
 !tests/smoke_test/datasets/
 !tests/smoke_test/datasets/**/*.npy
+
+yue_train.py
