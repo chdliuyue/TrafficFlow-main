@@ -113,7 +113,7 @@ class BasicTSForecastingConfig(BasicTSConfig):
     # Scaler settings
     scaler: type = field(default=ZScoreScaler, metadata={"help": "Scaler type."})
     norm_each_channel: bool = field(default=True, metadata={"help": "Whether to normalize data for each channel independently."})
-    rescale: bool = field(default=False, metadata={"help": "Whether to rescale data."})
+    rescale: bool = field(default=True, metadata={"help": "Whether to rescale data."})
 
     ############################## Metrics Configuration ##############################
 
