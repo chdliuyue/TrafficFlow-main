@@ -225,7 +225,9 @@ class TemporalGraphConv(nn.Module):
 
     def forward(self, x: torch.Tensor, time_ind: int) -> torch.Tensor:
         x = x.transpose(2, 3).contiguous()  # [B, C, T, N]
-        adp1 = torch.einsum("ad,def->aef", self.nodevec[time_ind], self.k)
+        # time-dependent vector should keep two dims for einsum
+        time_vec = self.nodevec[time_ind].unsqueeze(0)
+        adp1 = torch.einsum("ad,def->aef", time_vec, self.k)
         adp2 = torch.einsum("be,aef->abf", self.timevec1, adp1)
         adp3 = torch.einsum("cf,abf->abc", self.timevec2, adp2)
         adp = F.softmax(F.relu(adp3), dim=2)
@@ -247,7 +249,9 @@ class SpatialGraphConv(nn.Module):
         self.k = nn.Parameter(torch.randn(inter_dim, inter_dim, inter_dim))
 
     def forward(self, x: torch.Tensor, time_ind: int) -> torch.Tensor:
-        adp1 = torch.einsum("ad,def->aef", self.timevec[time_ind], self.k)
+        # preserve 2D shape for the time-dependent factor in einsum
+        time_vec = self.timevec[time_ind].unsqueeze(0)
+        adp1 = torch.einsum("ad,def->aef", time_vec, self.k)
         adp2 = torch.einsum("be,aef->abf", self.nodevec1, adp1)
         adp3 = torch.einsum("cf,abf->abc", self.nodevec2, adp2)
         adp = F.softmax(F.relu(adp3), dim=2)
