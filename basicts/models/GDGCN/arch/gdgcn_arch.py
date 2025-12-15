@@ -230,7 +230,10 @@ class TemporalGraphConv(nn.Module):
         adp1 = torch.einsum("ad,def->aef", time_vec, self.k)
         adp2 = torch.einsum("be,aef->abf", self.timevec1, adp1)
         adp3 = torch.einsum("cf,abf->abc", self.timevec2, adp2)
-        adp = F.softmax(F.relu(adp3), dim=2)
+        # adp3 keeps a singleton dimension for the time axis (shape: [1, T, T]).
+        # Squeeze it before sending to the neighborhood convolution to avoid
+        # einsum dimensionality mismatches inside NConv.
+        adp = F.softmax(F.relu(adp3), dim=2).squeeze(0)
         x = self.nconv(x, adp)
         x = F.dropout(x, self.dropout, training=self.training)
         return x.transpose(2, 3).contiguous()
@@ -254,7 +257,9 @@ class SpatialGraphConv(nn.Module):
         adp1 = torch.einsum("ad,def->aef", time_vec, self.k)
         adp2 = torch.einsum("be,aef->abf", self.nodevec1, adp1)
         adp3 = torch.einsum("cf,abf->abc", self.nodevec2, adp2)
-        adp = F.softmax(F.relu(adp3), dim=2)
+        # Remove the singleton dimension (shape: [1, N, N]) before NConv to keep
+        # the expected 2D adjacency shape.
+        adp = F.softmax(F.relu(adp3), dim=2).squeeze(0)
         x = self.nconv(x, adp)
         return F.dropout(x, self.dropout, training=self.training)
 
