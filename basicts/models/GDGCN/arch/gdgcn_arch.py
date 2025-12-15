@@ -383,5 +383,5 @@ class GDGCN(nn.Module):
         x = x.transpose(2, 3)
         x = x.reshape(x.size(0), x.size(1) * x.size(2), x.size(3), 1)
         x = self.end_conv_2(x)
-        # [B, Q, N, 1]
-        return x.squeeze(-1).transpose(1, 2)
+        # [B, Q, N, 1] -> [B, Q, N]
+        return x.squeeze(-1)
