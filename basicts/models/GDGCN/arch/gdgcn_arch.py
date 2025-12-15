@@ -336,6 +336,14 @@ class GDGCN(nn.Module):
             torch.Tensor: Prediction with shape [B, Q, N].
         """
         time_ind = _get_time_index(inputs_timestamps, steps_per_day=self.spatial.timevec.shape[0])
+        # Ensure dense 4D input: [B, P, N, C]
+        if inputs.is_sparse:
+            inputs = inputs.to_dense()
+        if inputs.dim() == 3:
+            inputs = inputs.unsqueeze(-1)
+        if inputs.dim() != 4:
+            raise ValueError(f"GDGCN expects 4D input [B, P, N, C], but got shape {tuple(inputs.shape)}")
+
         x = inputs.permute(0, 3, 2, 1).contiguous()
         x = self.start_conv(x)
         skip = 0
