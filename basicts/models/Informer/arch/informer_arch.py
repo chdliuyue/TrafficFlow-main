@@ -32,14 +32,14 @@ class Informer(nn.Module):
         self.enc_embedding = FeatureEmbedding(
             config.num_features,
             config.hidden_size,
-            use_timestamps=config.use_timestamps,
+            use_timestamps=config.use_timestamp,
             timestamp_sizes=config.timestamp_sizes,
             use_pe=True,
             dropout=config.dropout)
         self.dec_embedding = FeatureEmbedding(
             config.num_features,
             config.hidden_size,
-            use_timestamps=config.use_timestamps,
+            use_timestamps=config.use_timestamp,
             timestamp_sizes=config.timestamp_sizes,
             use_pe=True,
             dropout=config.dropout)
