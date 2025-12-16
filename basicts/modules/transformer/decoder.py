@@ -679,7 +679,7 @@ class Seq2SeqDecoder(nn.Module):
 
         self_attn_weights, cross_attn_weights = (), ()
         for layer in self.layers:
-            hidden_states, self_attns, cross_attns, _ = layer(
+            hidden_states, self_attns, cross_attns, *rest = layer(
                 hidden_states=hidden_states,
                 key_value_states=key_value_states,
                 attention_mask=attention_mask,
