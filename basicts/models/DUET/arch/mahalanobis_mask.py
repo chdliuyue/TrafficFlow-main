@@ -25,8 +25,8 @@ class MahalanobisMask(nn.Module):
         diff = X1 - X2
         temp = torch.einsum("dk,bxck->bxcd", self.A, diff)
         dist = torch.einsum("bxcd,bxcd->bxc", temp, temp)
-        # exp_dist = torch.exp(-dist)
-        exp_dist = 1 / (dist + 1e-10)
+        exp_dist = torch.exp(-dist)
+        # exp_dist = 1 / (dist + 1e-10)
         identity_matrices = 1 - torch.eye(exp_dist.shape[-1])
         mask = identity_matrices.repeat(exp_dist.shape[0], 1, 1).to(exp_dist.device)
         exp_dist = torch.einsum("bxc,bxc->bxc", exp_dist, mask)
