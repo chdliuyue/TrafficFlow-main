@@ -10,6 +10,8 @@ def main():
         input_len=12,
         output_len=12,
         num_features=358,
+        # use_timestamp=True,
+        # timestamp_sizes=[288, 7]
     )
 
 

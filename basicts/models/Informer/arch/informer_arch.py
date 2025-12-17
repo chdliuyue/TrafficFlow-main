@@ -26,6 +26,7 @@ class Informer(nn.Module):
     def __init__(self, config: InformerConfig):
         super().__init__()
         self.output_len = config.output_len
+        self.label_len = int(config.label_len)
         self.output_attentions = config.output_attentions
 
         # Embedding
@@ -112,12 +113,25 @@ class Informer(nn.Module):
             Output data with shape: [batch_size, output_len, num_features]
         """
 
+        B, input_len, C = inputs.shape
+        Ld = self.label_len + self.output_len  # decoder length
+
         enc_hidden_states = self.enc_embedding(inputs, inputs_timestamps)
         enc_hidden_states, enc_attn_weights = self.encoder(enc_hidden_states, output_attentions=self.output_attentions)
 
-        dec_hidden_states = self.dec_embedding(targets, targets_timestamps)
+        dec_inp = inputs.new_zeros(B, Ld, C)
+        dec_inp[:, :self.label_len, :] = inputs[:, -self.label_len:, :]
+        dec_ts = None
+        if (inputs_timestamps is not None) and (targets_timestamps is not None):
+            dec_ts = torch.cat(
+                [inputs_timestamps[:, -self.label_len:, :], targets_timestamps], dim=1
+            )
+
+        dec_hidden_states = self.dec_embedding(dec_inp, dec_ts)
+
+        # dec_hidden_states = self.dec_embedding(targets, targets_timestamps)
         attention_mask = prepare_causal_attention_mask(
-            (targets.shape[0], targets.shape[1]), dec_hidden_states)
+            (dec_hidden_states.shape[0], dec_hidden_states.shape[1]), dec_hidden_states)
         dec_hidden_states, dec_self_attn_weights, dec_cross_attn_weights = self.decoder(
             dec_hidden_states, enc_hidden_states, attention_mask, output_attentions=self.output_attentions)
         prediction = self.projection(dec_hidden_states)[:, -self.output_len:, :]
