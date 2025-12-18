@@ -77,10 +77,13 @@ class Timer(nn.Module):
         hidden_states = self.embedding(inputs)
 
         # decoder
+        bsz_eff = hidden_states.size(0)  # = batch_size * num_features
+        seq_len = hidden_states.size(1)
+
         hidden_states, _, _ = self.decoder(
             hidden_states,
             attention_mask=prepare_causal_attention_mask(
-                (batch_size, hidden_states.shape[1]),
+                (bsz_eff, seq_len),
                 hidden_states
             )
         )

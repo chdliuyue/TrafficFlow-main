@@ -169,13 +169,14 @@ class FrequencyMixingLayer(FrequencyBaseLayer):
 
 def frequency_interpolation(x, seq_len: int, target_len: int) -> torch.Tensor:
     len_ratio = seq_len / target_len
-    x_fft = torch.fft.rfft(x, dim=2)
+    x_fft = torch.fft.rfft(x, n=seq_len, dim=2)
     out_fft = torch.zeros(
         [x_fft.size(0), x_fft.size(1), target_len // 2 + 1],
         dtype=x_fft.dtype,
         device=x_fft.device)
-    out_fft[:, :, :seq_len // 2 + 1] = x_fft
-    out = torch.fft.irfft(out_fft, dim=2)
+    copy_len = min(out_fft.size(2), x_fft.size(2))
+    out_fft[:, :, :copy_len] = x_fft[:, :, :copy_len]
+    out = torch.fft.irfft(out_fft, n=target_len, dim=2)
     return out * len_ratio
 
 

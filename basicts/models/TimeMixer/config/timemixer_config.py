@@ -30,5 +30,5 @@ class TimeMixerConfig(BasicTSModelConfig):
         default="moving_avg", metadata={"help": "Decomposition method. 'moving_avg' or 'dft_decomp'."})
     moving_avg: int = field(default=25, metadata={"help": "Kernel size of moving average."})
     top_k: int = field(default=5, metadata={"help": "Top-k of amplitude when use DFTDecomposition."})
-    use_timestamps: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
+    use_timestamp: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
     timestamp_sizes: Sequence[int] = field(default=None, metadata={"help": "Sizes of timestamps."})

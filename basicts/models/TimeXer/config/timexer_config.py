@@ -13,7 +13,7 @@ class TimeXerConfig(BasicTSModelConfig):
     input_len: int = field(default=None, metadata={"help": "Input sequence length."})
     output_len: int = field(default=None, metadata={"help": "Output sequence length for forecasting task."})
     num_features: int = field(default=None, metadata={"help": "Number of features."})
-    patch_len: int = field(default=8, metadata={"help": "Patch length."})
+    patch_len: int = field(default=4, metadata={"help": "Patch length."})
     hidden_size: int = field(default=256, metadata={"help": "Hidden size."})
     n_heads: int = field(default=1, metadata={"help": "Number of heads in multi-head attention."})
     intermediate_size: int = field(default=1024, metadata={"help": "Intermediate size of FFN layers."})

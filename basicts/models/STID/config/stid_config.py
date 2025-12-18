@@ -22,9 +22,9 @@ class STIDConfig(BasicTSModelConfig):
     if_spatial: bool = field(default=True, metadata={"help": "Whether to use spatial (feature) embedding."})
     spatial_hidden_size: int = field(default=32, metadata={"help": "Hidden size of spatial embedding."})
 
-    if_time_in_day: bool = field(default=False, metadata={"help": "Whether to use time of day embedding."})
-    if_day_in_week: bool = field(default=False, metadata={"help": "Whether to use day of week embedding."})
-    num_time_in_day: int = field(default=24, metadata={"help": "Number of timestamps in a day, e.g., " \
+    if_time_in_day: bool = field(default=True, metadata={"help": "Whether to use time of day embedding."})
+    if_day_in_week: bool = field(default=True, metadata={"help": "Whether to use day of week embedding."})
+    num_time_in_day: int = field(default=288, metadata={"help": "Number of timestamps in a day, e.g., " \
                                                        "24 represents the 24 distinct timestamps in a day (sampled at an hourly frequency)."})
     num_day_in_week: int = field(default=7, metadata={"help": "Number of timestamps in a week, e.g., " \
                                                       "7 represents the 7 distinct timestamps in a week."})

@@ -43,7 +43,7 @@ class TimeMixerBackBone(nn.Module):
         embed_channels = 1 if self.channel_independence else config.num_features
         self.enc_embedding = FeatureEmbedding(embed_channels,
             config.hidden_size,
-            use_timestamps=config.use_timestamps,
+            use_timestamps=config.use_timestamp,
             timestamp_sizes=config.timestamp_sizes,
             dropout=config.dropout)
         self.norm_layers = nn.ModuleList([RevIN(config.num_features, affine=True)
@@ -73,16 +73,25 @@ class TimeMixerBackBone(nn.Module):
         multi_scale_inputs = [inputs]
         multi_scale_timestamps = [inputs_timestamps] if inputs_timestamps is not None else None
         sample = inputs.permute(0, 2, 1) # [batch_size, num_features, seq_len]
-        sample_ts = inputs_timestamps.permute(0, 2, 1) if inputs_timestamps is not None else None
+        # sample_ts = inputs_timestamps.permute(0, 2, 1) if inputs_timestamps is not None else None
+        sample_ts = inputs_timestamps
 
         for _ in range(self.down_sampling_layers):
             down_sampled = self.down_pooling(sample)
             multi_scale_inputs.append(down_sampled.permute(0, 2, 1))
             sample = down_sampled
 
-            if inputs_timestamps is not None:
-                multi_scale_timestamps.append(sample_ts[:, :, ::self.down_sampling_window])
-                sample_ts = sample_ts[:, :, ::self.down_sampling_window]
+            if sample_ts is not None:
+                Ld = down_sampled.size(-1)
+                sample_ts = sample_ts[:, ::self.down_sampling_window, :]  # [B, ~Ld, 2]
+                # ✅ 对齐 pool 真实输出长度（避免 L=奇数时多 1）
+                if sample_ts.size(1) > Ld:
+                    sample_ts = sample_ts[:, :Ld, :]
+                multi_scale_timestamps.append(sample_ts)
+
+            # if inputs_timestamps is not None:
+            #     multi_scale_timestamps.append(sample_ts[:, :, ::self.down_sampling_window])
+            #     sample_ts = sample_ts[:, :, ::self.down_sampling_window]
 
         return multi_scale_inputs, multi_scale_timestamps
 
@@ -102,8 +111,11 @@ class TimeMixerBackBone(nn.Module):
                 x_list[i] = self.norm_layers[i](x_list[i], "norm")
             if self.channel_independence:
                 x_list[i] = x_list[i].transpose(1, 2).reshape(-1, input_len, 1)
-            if x_ts_list is not None:
-                x_ts_list[i] = x_ts_list[i].repeat(num_features, 1, 1)
+            # if x_ts_list is not None:
+            #     x_ts_list[i] = x_ts_list[i].repeat(num_features, 1, 1)
+                if x_ts_list is not None:
+                    # x reshape 成 [B*C, L, 1] 后，timestamps 也要变成 [B*C, L, 2]
+                    x_ts_list[i] = x_ts_list[i].repeat_interleave(num_features, dim=0)
 
         # decomposition for forecasting task
         if decomp:

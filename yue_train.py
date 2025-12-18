@@ -1,29 +1,38 @@
 from basicts import BasicTSLauncher
 from basicts.configs import BasicTSForecastingConfig
-from basicts.models.SOFTS import SOFTS, SOFTSConfig
+# from basicts.runners.callback import AddAuxiliaryLoss
+# from basicts.runners.callback import NoBP
+from basicts.models.TimesNet import TimesNetConfig, TimesNetForForecasting
 
 
 def main():
 
-    model_config = SOFTSConfig(
+    model_config = TimesNetConfig(
         input_len=12,
         output_len=12,
         # label_len=6,
         num_features=358,
+        # chunk_size=4,
+        # channel_independence=True,
+        # individual=True,
+        # individual_head=True,
+        # cut_freq=6,
         # seg_len=4,
-        # use_timestamp=True,
-        # timestamp_sizes=[288, 7]
+        # period_len=4,
+        use_timestamp=True,
+        timestamp_sizes=[288, 7]
     )
 
 
     BasicTSLauncher.launch_training(BasicTSForecastingConfig(
-        model=SOFTS,
+        model=TimesNetForForecasting,
         input_len=12,
         output_len=12,
         model_config=model_config,
         dataset_name="PEMS03",
         # loss="MAE",
-        # callbacks=[AddAuxiliaryLoss(["aux_loss"])],
+        # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
+        # callbacks = [NoBP()], # HI
         gpus="0",
         # compile_model=True,
         # train_data_prefetch=True,

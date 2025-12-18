@@ -21,5 +21,5 @@ class TimesNetConfig(BasicTSModelConfig):
     num_layers: int = field(default=1, metadata={"help": "Number of encoder layers."})
     dropout: float = field(default=0.1, metadata={"help": "Dropout rate."})
     top_k: int = field(default=5, metadata={"help": "Top-k of amplitude in FFT."})
-    use_timestamps: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
+    use_timestamp: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
     timestamp_sizes: Sequence[int] = field(default=None, metadata={"help": "Sizes of timestamps."})
