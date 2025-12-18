@@ -22,14 +22,29 @@ def masked_huber(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: 
         torch.Tensor: A scalar tensor representing the masked Huber loss.
     """
 
+    # mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+    #
+    # mask = mask.float()
+    # prediction, targets = prediction * mask, targets * mask
+    #
+    # prediction = torch.nan_to_num(prediction)
+    # targets = torch.nan_to_num(targets)
+    #
+    # loss = HuberLoss(reduction, delta)(prediction, targets)
+    #
+    # return loss
     mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
-
     mask = mask.float()
-    prediction, targets = prediction * mask, targets * mask
 
-    prediction = torch.nan_to_num(prediction)
-    targets = torch.nan_to_num(targets)
+    # element-wise huber
+    loss = HuberLoss(reduction='none', delta=delta)(prediction, targets)
+    loss = torch.nan_to_num(loss) * torch.nan_to_num(mask)
 
-    loss = HuberLoss(reduction, delta)(prediction, targets)
+    if reduction == 'none':
+        return loss
+    if reduction == 'sum':
+        return loss.sum()
+    # mean over valid entries
+    denom = mask.sum() + 1e-6
 
-    return loss
+    return loss.sum() / denom

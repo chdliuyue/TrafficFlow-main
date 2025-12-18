@@ -21,25 +21,47 @@ def masked_corr(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: t
 
     """
 
+    # mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+    #
+    # mask = mask.float()
+    # mask /= torch.mean(mask)  # Normalize mask to avoid bias in the loss due to the number of valid entries
+    # mask = torch.nan_to_num(mask)  # Replace any NaNs in the mask with zero
+    #
+    # prediction_mean = torch.mean(prediction, dim=1, keepdim=True)
+    # target_mean = torch.mean(targets, dim=1, keepdim=True)
+    #
+    # # Compute the deviation of prediction and target from their means
+    # prediction_dev = prediction - prediction_mean
+    # target_dev = targets - target_mean
+    #
+    # # Compute the Pearson Correlation Coefficient
+    # numerator = torch.sum(prediction_dev * target_dev, dim=1, keepdim=True)
+    # denominator = torch.sqrt(torch.sum(prediction_dev ** 2, dim=1, keepdim=True) * torch.sum(target_dev ** 2, dim=1, keepdim=True))  # 分母
+    # loss = numerator / denominator
+    #
+    # loss = loss * mask  # Apply the mask to the loss
+    # loss = torch.nan_to_num(loss)  # Replace any NaNs in the loss with zero
+    #
+    # return torch.mean(loss)
     mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
-
     mask = mask.float()
-    mask /= torch.mean(mask)  # Normalize mask to avoid bias in the loss due to the number of valid entries
-    mask = torch.nan_to_num(mask)  # Replace any NaNs in the mask with zero
 
-    prediction_mean = torch.mean(prediction, dim=1, keepdim=True)
-    target_mean = torch.mean(targets, dim=1, keepdim=True)
+    eps = 1e-6
+    # 假设 prediction/targets: [B, L, N]，在 L 维做相关
+    w = mask
+    w_sum = w.sum(dim=1, keepdim=True) + eps
 
-    # Compute the deviation of prediction and target from their means
-    prediction_dev = prediction - prediction_mean
-    target_dev = targets - target_mean
+    px = (prediction * w).sum(dim=1, keepdim=True) / w_sum
+    tx = (targets    * w).sum(dim=1, keepdim=True) / w_sum
 
-    # Compute the Pearson Correlation Coefficient
-    numerator = torch.sum(prediction_dev * target_dev, dim=1, keepdim=True)
-    denominator = torch.sqrt(torch.sum(prediction_dev ** 2, dim=1, keepdim=True) * torch.sum(target_dev ** 2, dim=1, keepdim=True))  # 分母
-    loss = numerator / denominator
+    p_dev = (prediction - px) * w
+    t_dev = (targets    - tx) * w
 
-    loss = loss * mask  # Apply the mask to the loss
-    loss = torch.nan_to_num(loss)  # Replace any NaNs in the loss with zero
+    num = (p_dev * t_dev).sum(dim=1)                 # [B, N]
+    den = torch.sqrt((p_dev**2).sum(dim=1) * (t_dev**2).sum(dim=1)) + eps
 
-    return torch.mean(loss)
+    corr = num / den
+    corr = torch.nan_to_num(corr)
+    corr = torch.clamp(corr, -1.0, 1.0)
+
+    return corr.mean()

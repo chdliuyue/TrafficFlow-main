@@ -22,10 +22,19 @@ def main():
         output_len=12,
         model_config=model_config,
         dataset_name="PEMS03",
-        metrics=["MAE", "MSE", "RMSE", "MAPE", "WAPE", "SMAPE", "R2", "CORR", "HUBER"],
-        loss="MAE",
+        # loss="MAE",
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])],
-        gpus="0"
+        gpus="0",
+        # compile_model=True,
+        # train_data_prefetch=True,
+        # train_data_num_workers=4,
+        # train_data_pin_memory=True,
+        # val_data_prefetch=True,
+        # val_data_num_workers=4,
+        # val_data_pin_memory=True,
+        # test_data_prefetch=True,
+        # test_data_num_workers=4,
+        # test_data_pin_memory=True,
     ))
 
 

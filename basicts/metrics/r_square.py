@@ -21,19 +21,40 @@ def masked_r2(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: tor
 
     """
 
+    # mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+    #
+    # mask = mask.float()
+    # prediction, targets = prediction * mask, targets * mask
+    #
+    # prediction = torch.nan_to_num(prediction)
+    # targets = torch.nan_to_num(targets)
+    #
+    # ss_res = torch.sum(torch.pow((targets - prediction), 2), dim=1)
+    # ss_tot = torch.sum(torch.pow(targets - torch.mean(targets, dim=1, keepdim=True), 2), dim=1)
+    #
+    # # 计算 R^2
+    # loss = 1 - (ss_res / (ss_tot + 1e-6))
+    #
+    # loss = torch.nan_to_num(loss)  # Replace any NaNs in the loss with zero
+    # return torch.mean(loss)
+
     mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
-
     mask = mask.float()
-    prediction, targets = prediction * mask, targets * mask
 
-    prediction = torch.nan_to_num(prediction)
-    targets = torch.nan_to_num(targets)
+    prediction = torch.nan_to_num(prediction) * mask
+    targets = torch.nan_to_num(targets) * mask
 
-    ss_res = torch.sum(torch.pow((targets - prediction), 2), dim=1)
-    ss_tot = torch.sum(torch.pow(targets - torch.mean(targets, dim=1, keepdim=True), 2), dim=1)
+    # ✅ 只在有效位置上计算“全局均值”
+    cnt = torch.sum(mask)
+    if cnt.item() == 0:
+        return torch.zeros((), device=targets.device, dtype=targets.dtype)
 
-    # 计算 R^2
-    loss = 1 - (ss_res / (ss_tot + 1e-6))
+    mean_t = torch.sum(targets) / (cnt + 1e-6)
 
-    loss = torch.nan_to_num(loss)  # Replace any NaNs in the loss with zero
-    return torch.mean(loss)
+    ss_res = torch.sum((targets - prediction) ** 2)  # 有效位置外是 0，不影响
+    ss_tot = torch.sum(((targets - mean_t) ** 2) * mask)  # 只统计有效位置的方差
+
+    r2 = torch.where(ss_tot < 1e-6, torch.zeros_like(ss_tot), 1.0 - ss_res / (ss_tot + 1e-6))
+    r2 = torch.nan_to_num(r2)
+
+    return r2

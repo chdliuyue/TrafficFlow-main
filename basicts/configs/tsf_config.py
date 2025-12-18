@@ -118,7 +118,7 @@ class BasicTSForecastingConfig(BasicTSConfig):
     ############################## Metrics Configuration ##############################
 
     metrics: List[Union[str, Tuple[str, Callable]]] = field(
-        default_factory=lambda: ["MAE", "MSE", "RMSE", "MAPE", "WAPE"],
+        default_factory=lambda: ["MAE", "MSE", "RMSE", "MAPE", "WAPE", "SMAPE", "R2", "CORR", "HUBER"],
         metadata={"help": "Metric names. If metric is a string, it should be in `basicts.metrics.ALL_METRICS`. " \
                   "Otherwise, it should be a tuple of (metric_name: str, metric_function: Callable)."})
 

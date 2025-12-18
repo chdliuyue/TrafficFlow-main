@@ -19,13 +19,25 @@ def masked_wape(prediction: torch.Tensor, targets: torch.Tensor, targets_mask: t
         torch.Tensor: A scalar tensor representing the masked weighted absolute percentage error.
     """
 
+    # mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+    # mask = mask.float()
+    # prediction, targets = prediction * mask, targets * mask
+    #
+    # prediction = torch.nan_to_num(prediction)
+    # targets = torch.nan_to_num(targets)
+    #
+    # loss = torch.sum(torch.abs(prediction - targets), dim=1) / (torch.sum(torch.abs(targets), dim=1) + 5e-5)
+    #
+    # return torch.mean(loss)
+
     mask = targets_mask if targets_mask is not None else torch.ones_like(targets)
+    # 统一成 float mask（兼容 bool/float）
     mask = mask.float()
-    prediction, targets = prediction * mask, targets * mask
+    prediction = torch.nan_to_num(prediction) * mask
+    targets = torch.nan_to_num(targets) * mask
+    # ✅ 全局 WAPE：sum(|e|) / sum(|y|)
+    denom = torch.sum(torch.abs(targets)) + 5e-5
+    numer = torch.sum(torch.abs(prediction - targets))
+    loss = numer / denom
 
-    prediction = torch.nan_to_num(prediction)
-    targets = torch.nan_to_num(targets)
-
-    loss = torch.sum(torch.abs(prediction - targets), dim=1) / (torch.sum(torch.abs(targets), dim=1) + 5e-5)
-
-    return torch.mean(loss)
+    return loss
