@@ -29,5 +29,5 @@ class NonstationaryTransformerConfig(BasicTSModelConfig):
     dropout: float = field(default=0.1, metadata={"help": "Dropout rate."})
     threshold: float = field(default=80.0, metadata={"help": "Threshold in clamp function to avoid large values."})
     output_attentions: bool = field(default=False, metadata={"help": "Whether to output attention weights."})
-    use_timestamps: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
+    use_timestamp: bool = field(default=False, metadata={"help": "Whether to use timestamps as tokens."})
     timestamp_sizes: Sequence[int] = field(default=None, metadata={"help": "Sizes of timestamps."})
