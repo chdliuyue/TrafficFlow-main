@@ -21,6 +21,7 @@ class SOFTS(nn.Module):
         super().__init__()
         self.input_len = config.input_len
         self.output_len = config.output_len
+        self.num_features = config.num_features
         self.enc_embedding = SequenceEmbedding(config.input_len, config.hidden_size, config.dropout)
         # Encoder
         self.encoder = Encoder(
@@ -44,7 +45,7 @@ class SOFTS(nn.Module):
 
         self.use_revin = config.use_revin
         if self.use_revin:
-            self.revin = RevIN()
+            self.revin = RevIN(self.num_features)
 
     def forward(self, inputs: torch.Tensor, inputs_timestamps: torch.Tensor) -> torch.Tensor:
         """
