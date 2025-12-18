@@ -2,15 +2,15 @@ from basicts import BasicTSLauncher
 from basicts.configs import BasicTSForecastingConfig
 # from basicts.runners.callback import AddAuxiliaryLoss
 # from basicts.runners.callback import NoBP
-from basicts.models.TimesNet import TimesNetConfig, TimesNetForForecasting
+from basicts.models.Autoformer import Autoformer, AutoformerConfig
 
 
 def main():
 
-    model_config = TimesNetConfig(
+    model_config = AutoformerConfig(
         input_len=12,
         output_len=12,
-        # label_len=6,
+        label_len=6,
         num_features=358,
         # chunk_size=4,
         # channel_independence=True,
@@ -25,7 +25,7 @@ def main():
 
 
     BasicTSLauncher.launch_training(BasicTSForecastingConfig(
-        model=TimesNetForForecasting,
+        model=Autoformer,
         input_len=12,
         output_len=12,
         model_config=model_config,
@@ -34,6 +34,7 @@ def main():
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
         # callbacks = [NoBP()], # HI
         gpus="0",
+        tf32=True,
         # compile_model=True,
         # train_data_prefetch=True,
         # train_data_num_workers=4,
