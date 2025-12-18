@@ -7,7 +7,7 @@ from basicts.runners.callback import BasicTSCallback
 from basicts.runners.taskflow import (BasicTSForecastingTaskFlow,
                                       BasicTSTaskFlow)
 from basicts.scaler import ZScoreScaler
-from torch.optim import Adam
+from torch.optim import AdamW
 
 from .base_config import BasicTSConfig
 from .model_config import BasicTSModelConfig
@@ -143,9 +143,9 @@ class BasicTSForecastingConfig(BasicTSConfig):
         default="MAE", metadata={"help": "Loss function. If a string, it should be in `basicts.metrics.ALL_METRICS`."})
 
     # Optimizer
-    optimizer: type = field(default=Adam, metadata={"help": "Optimizer class."})
+    optimizer: type = field(default=AdamW, metadata={"help": "Optimizer class."})
     optimizer_params: dict = field(
-        default_factory=lambda: {"lr": 2e-4, "weight_decay": 5e-4},
+        default_factory=lambda: {"lr": 2e-4, "weight_decay": 1e-4},
         metadata={"help": "Optimizer parameters."})
     lr: float = field(default=2e-4, metadata={"help": "Learning rate."})
 
