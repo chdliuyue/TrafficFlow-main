@@ -179,7 +179,8 @@ class NonstationaryTransformerForForecasting(nn.Module):
 
         enc_hidden_states, enc_attn_weights, tau, delta = self.backbone(inputs, inputs_timestamps)
         dec_hidden_states = torch.cat([inputs[:, -self.label_len:, :], torch.zeros_like(targets)], dim=1)
-        dec_hidden_states = self.dec_embedding(dec_hidden_states, targets_timestamps)
+        dec_timestamps = torch.cat([inputs_timestamps[:, -self.label_len:, :], targets_timestamps],dim=1)
+        dec_hidden_states = self.dec_embedding(dec_hidden_states, dec_timestamps)
         dec_hidden_states, dec_self_attn_weights, dec_cross_attn_weights = self.decoder(
             dec_hidden_states, enc_hidden_states, tau=tau, delta=delta)
         prediction = self.prediction_head(dec_hidden_states)[:, -self.output_len:, :]

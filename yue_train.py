@@ -23,7 +23,6 @@ def main():
         dataset_name="PEMS03",
         metrics=["MAE", "MSE", "RMSE", "MAPE", "WAPE", "SMAPE", "R2", "CORR", "HUBER"],
         loss="MAE",
-        use_timestamps=False,
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])],
         gpus="0"
     ))
