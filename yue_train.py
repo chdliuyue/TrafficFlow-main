@@ -1,51 +1,45 @@
 from basicts import BasicTSLauncher
 from basicts.configs import BasicTSForecastingConfig
 from basicts.runners.callback import GradientClipping, EarlyStopping
-# from basicts.runners.callback import AddAuxiliaryLoss
+from basicts.runners.callback import AddAuxiliaryLoss
 # from basicts.runners.callback import NoBP
-from basicts.models.Autoformer import Autoformer, AutoformerConfig
+from basicts.models.MyModel_gpt import MyModel, MyModelConfig
 
 
 def main():
 
-    model_config = AutoformerConfig(
+    model_config = MyModelConfig(
         input_len=12,
         output_len=12,
-        label_len=6,
         num_features=358,
-        # chunk_size=4,
-        # channel_independence=True,
-        # individual=True,
-        # individual_head=True,
-        # cut_freq=6,
-        # seg_len=4,
-        # period_len=4,
-        use_timestamp=True,
-        timestamp_sizes=[288, 7]
+        use_input_timestamps=True,
+        use_output_timestamps=True,
+        likelihood="gaussian",
+        # timestamp_sizes=[288, 7]
     )
 
 
     BasicTSLauncher.launch_training(BasicTSForecastingConfig(
-        model=Autoformer,
+        model=MyModel,
         input_len=12,
         output_len=12,
         model_config=model_config,
         dataset_name="PEMS03",
         # loss="MAE",
-        num_epochs=200,
-        callbacks=[GradientClipping(1.0), EarlyStopping()],
+        num_epochs=300,
+        callbacks=[GradientClipping(1.0), EarlyStopping(20)],
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
         # callbacks = [NoBP()], # HI
         gpus="0",
         tf32=True,
         # train_data_prefetch=True,
-        # train_data_num_workers=4,
+        # train_data_num_workers=2,
         # train_data_pin_memory=True,
         # val_data_prefetch=True,
-        # val_data_num_workers=4,
+        # val_data_num_workers=2,
         # val_data_pin_memory=True,
         # test_data_prefetch=True,
-        # test_data_num_workers=4,
+        # test_data_num_workers=2,
         # test_data_pin_memory=True,
     ))
 

@@ -9,6 +9,7 @@ from .r_square import masked_r2
 from .rmse import masked_rmse
 from .smape import masked_smape
 from .wape import masked_wape
+from .myloss import compute_total_loss
 
 ALL_METRICS = {
             'MAE': masked_mae,
@@ -21,6 +22,7 @@ ALL_METRICS = {
             'CORR': masked_corr,
             'HUBER': masked_huber,
             'Accuracy': accuracy,
+            'myloss': compute_total_loss,
             }
 
 METRIC_METER = {
@@ -41,5 +43,6 @@ __all__ = [
     'masked_huber',
     'accuracy',
     'ALL_METRICS',
-    'METRIC_METER'
+    'METRIC_METER',
+    'compute_total_loss'
 ]
