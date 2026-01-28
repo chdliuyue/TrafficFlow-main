@@ -233,13 +233,22 @@ def compute_regularization(outputs: Dict, reg: RegWeights) -> torch.Tensor:
         if s.ndim == 3 and s.shape[1] > 1:
             reg_loss = reg_loss + float(reg.reg_graph_scale_smooth) * ((s[:, 1:] - s[:, :-1]) ** 2).mean()
 
+    # NOTE:
+    #   For convex fusion (w_base + w_graph = 1, w>=0), an L1 penalty on BOTH weights is constant.
+    #   So we interpret reg_fusion_l1 as a sparsity penalty on the *graph weight* w_graph only
+    #   (encourages the model to use spatial correction only when it helps generalization).
     if reg.reg_fusion_l1 > 0 and "fusion_weights" in outputs and isinstance(outputs["fusion_weights"], dict):
-        vals = []
-        for _, v in outputs["fusion_weights"].items():
-            if torch.is_tensor(v):
-                vals.append(torch.abs(v).float())
-        if len(vals) > 0:
-            reg_loss = reg_loss + float(reg.reg_fusion_l1) * torch.stack(vals).mean()
+        fw = outputs["fusion_weights"]
+        if ("w_graph" in fw) and torch.is_tensor(fw["w_graph"]):
+            reg_loss = reg_loss + float(reg.reg_fusion_l1) * torch.abs(fw["w_graph"]).float().mean()
+        else:
+            # fallback: average over all provided weights
+            vals = []
+            for _, v in fw.items():
+                if torch.is_tensor(v):
+                    vals.append(torch.abs(v).float().mean())
+            if len(vals) > 0:
+                reg_loss = reg_loss + float(reg.reg_fusion_l1) * torch.stack(vals).mean()
 
     return reg_loss
 

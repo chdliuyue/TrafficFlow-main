@@ -11,11 +11,46 @@ def main():
     model_config = MyModelConfig(
         input_len=12,
         output_len=12,
-        num_features=358,
+        num_features=883,
+
+        backbone_type="gru",
+        backbone_layers=2,
+        backbone_hidden_size=256,
+        backbone_dropout=0.0,
+
         use_input_timestamps=True,
         use_output_timestamps=True,
-        likelihood="gaussian",
-        # timestamp_sizes=[288, 7]
+
+        node_emb_dim=0,
+        step_emb_dim=0,
+
+        enable_dynamic_graph=True,
+        graph_nonnegative_basis=False,
+        graph_normalize=False,
+        graph_rank=64,
+        graph_alpha=0.1,
+        graph_scale_hidden_size=256,
+        graph_scale_dropout=0.0,
+
+        reg_graph_orth=0.0,
+        reg_graph_l1=0.0,
+        reg_graph_scale_smooth=0.0,
+
+        fusion_learnable=True,
+        fusion_raw_init=-1.0,
+        reg_fusion_l1=0.0,
+
+        enable_time_effect=True,
+        time_tod_harmonics=4,
+        time_dow_harmonics=2,
+        time_coef_hidden=128,
+        time_coef_dropout=0.1,
+
+        likelihood="none",
+
+        lambda_nll=0.0,
+        dropout=0.0,
+
     )
 
 
@@ -24,23 +59,23 @@ def main():
         input_len=12,
         output_len=12,
         model_config=model_config,
-        dataset_name="PEMS03",
+        dataset_name="PEMS07",
         # loss="MAE",
         num_epochs=300,
-        callbacks=[GradientClipping(1.0), EarlyStopping(20)],
+        callbacks=[EarlyStopping(30)],
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
         # callbacks = [NoBP()], # HI
         gpus="0",
         tf32=True,
-        # train_data_prefetch=True,
-        # train_data_num_workers=2,
-        # train_data_pin_memory=True,
-        # val_data_prefetch=True,
-        # val_data_num_workers=2,
-        # val_data_pin_memory=True,
-        # test_data_prefetch=True,
-        # test_data_num_workers=2,
-        # test_data_pin_memory=True,
+        train_data_prefetch=True,
+        train_data_num_workers=2,
+        train_data_pin_memory=True,
+        val_data_prefetch=True,
+        val_data_num_workers=2,
+        val_data_pin_memory=True,
+        test_data_prefetch=True,
+        test_data_num_workers=2,
+        test_data_pin_memory=True,
     ))
 
 
