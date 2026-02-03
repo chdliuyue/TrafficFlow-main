@@ -204,55 +204,78 @@ class RegWeights:
     reg_fusion_l1: float = 0.0
 
 
+
 def compute_regularization(outputs: Dict, reg: RegWeights) -> torch.Tensor:
-    # infer device
-    device = None
-    dtype = None
-    for k in ["prediction", "graph_basis", "graph_scales"]:
-        if k in outputs and torch.is_tensor(outputs[k]):
-            device = outputs[k].device
-            dtype = outputs[k].dtype
+    """
+    Regularization terms for interpretability / identifiability.
+
+    Supported basis keys:
+      - symmetric operator: outputs["graph_basis"]            [N,r]
+      - directed operator:  outputs["graph_left_basis"]       [N,r], outputs["graph_right_basis"] [N,r]
+
+    Other optional keys:
+      - outputs["graph_scales"]   [B,O,r]
+      - outputs["fusion_weights"] dict with key "w_graph" (any shape; we take mean(abs(.)))
+    """
+    # infer dev
+    dev = None
+    for k, v in outputs.items():
+        if torch.is_tensor(v):
+            dev = v.device
             break
-    if device is None:
-        return torch.tensor(0.0)
+        if isinstance(v, dict):
+            for vv in v.values():
+                if torch.is_tensor(vv):
+                    dev = vv.device
+                    break
+    if dev is None:
+        dev = torch.device("cpu")
 
-    reg_loss = torch.zeros((), device=device, dtype=dtype)
+    reg_loss = torch.zeros((), device=dev)
 
-    if reg.reg_graph_orth > 0 and "graph_basis" in outputs:
-        B = outputs["graph_basis"]  # [N,r]
-        rdim = B.shape[1]
-        gram = (B.T @ B) / (B.shape[0] + 1e-6)
-        I = torch.eye(rdim, device=device, dtype=dtype)
-        reg_loss = reg_loss + float(reg.reg_graph_orth) * ((gram - I) ** 2).mean()
+    # ---------- graph basis regularization ----------
+    def _basis_regs(B: torch.Tensor) -> torch.Tensor:
+        rl = torch.zeros((), device=B.device)
+        if reg.reg_graph_orth > 0:
+            rdim = B.shape[1]
+            BtB = B.T @ B  # [r,r]
+            I = torch.eye(rdim, device=B.device, dtype=BtB.dtype)
+            rl = rl + float(reg.reg_graph_orth) * torch.mean((BtB - I) ** 2)
+        if reg.reg_graph_l1 > 0:
+            rl = rl + float(reg.reg_graph_l1) * torch.mean(torch.abs(B))
+        return rl
 
-    if reg.reg_graph_l1 > 0 and "graph_basis" in outputs:
-        reg_loss = reg_loss + float(reg.reg_graph_l1) * torch.abs(outputs["graph_basis"]).mean()
+    if "graph_basis" in outputs and torch.is_tensor(outputs["graph_basis"]):
+        reg_loss = reg_loss + _basis_regs(outputs["graph_basis"])
+    else:
+        # directed / two-basis case
+        if "graph_left_basis" in outputs and torch.is_tensor(outputs["graph_left_basis"]):
+            reg_loss = reg_loss + _basis_regs(outputs["graph_left_basis"])
+        if "graph_right_basis" in outputs and torch.is_tensor(outputs["graph_right_basis"]):
+            reg_loss = reg_loss + _basis_regs(outputs["graph_right_basis"])
 
-    if reg.reg_graph_scale_smooth > 0 and "graph_scales" in outputs:
+    # ---------- graph scale smoothness across horizons ----------
+    if reg.reg_graph_scale_smooth > 0 and "graph_scales" in outputs and torch.is_tensor(outputs["graph_scales"]):
         s = outputs["graph_scales"]  # [B,O,r]
         if s.ndim == 3 and s.shape[1] > 1:
-            reg_loss = reg_loss + float(reg.reg_graph_scale_smooth) * ((s[:, 1:] - s[:, :-1]) ** 2).mean()
+            ds = s[:, 1:, :] - s[:, :-1, :]
+            reg_loss = reg_loss + float(reg.reg_graph_scale_smooth) * torch.mean(ds ** 2)
 
-    # NOTE:
-    #   For convex fusion (w_base + w_graph = 1, w>=0), an L1 penalty on BOTH weights is constant.
-    #   So we interpret reg_fusion_l1 as a sparsity penalty on the *graph weight* w_graph only
-    #   (encourages the model to use spatial correction only when it helps generalization).
+    # ---------- fusion weight sparsity ----------
+    # NOTE: L1 on {w_base,w_graph} with w_base+w_graph=1 is constant.
+    # Here we interpret reg_fusion_l1 as sparsity penalty on the *graph weight* w_graph only
+    # (encourages the model to use spatial correction when it helps generalization).
     if reg.reg_fusion_l1 > 0 and "fusion_weights" in outputs and isinstance(outputs["fusion_weights"], dict):
         fw = outputs["fusion_weights"]
-        if ("w_graph" in fw) and torch.is_tensor(fw["w_graph"]):
+        if "w_graph" in fw and torch.is_tensor(fw["w_graph"]):
             reg_loss = reg_loss + float(reg.reg_fusion_l1) * torch.abs(fw["w_graph"]).float().mean()
         else:
-            # fallback: average over all provided weights
-            vals = []
-            for _, v in fw.items():
-                if torch.is_tensor(v):
-                    vals.append(torch.abs(v).float().mean())
+            # fallback: average over all provided tensors
+            vals = [v.float().mean() for v in fw.values() if torch.is_tensor(v)]
             if len(vals) > 0:
                 reg_loss = reg_loss + float(reg.reg_fusion_l1) * torch.stack(vals).mean()
 
     return reg_loss
-
-
 # =========================
 # Total loss (for internal forward computation)
 # =========================

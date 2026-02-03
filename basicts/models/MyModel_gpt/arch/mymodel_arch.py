@@ -343,6 +343,8 @@ class LowRankDynamicKernelOnFeatures(nn.Module):
         nonnegative_basis: bool,
         normalize: bool,
         alpha: float,
+        scale_activation: str = "softplus",
+        scale_bound: float = 1.0,
         step_emb_dim: int = 0,
         use_step_embedding: bool = False,
         eps: float = 1e-6,
@@ -359,6 +361,8 @@ class LowRankDynamicKernelOnFeatures(nn.Module):
         self.nonneg = bool(nonnegative_basis)
         self.normalize = bool(normalize)
         self.eps = float(eps)
+        self.scale_act = str(scale_activation).lower()
+        self.scale_bound = float(scale_bound)
 
         self.alpha = nn.Parameter(torch.tensor(float(alpha)))
 
@@ -413,7 +417,12 @@ class LowRankDynamicKernelOnFeatures(nn.Module):
 
         feat = torch.cat(feat_parts, dim=-1)  # [B,O, ...]
         s_raw = self.scale_mlp(feat)          # [B,O,r]
-        s = torch.nn.functional.softplus(s_raw)  # >=0
+        if self.scale_act == "softplus":
+            s = torch.nn.functional.softplus(s_raw)  # >=0
+        elif self.scale_act == "tanh":
+            s = self.scale_bound * torch.tanh(s_raw)  # signed, bounded
+        else:
+            raise ValueError(f"Unknown graph_scale_activation: {self.scale_act} (expected softplus|tanh)")
 
         # M = B ( s ⊙ (B^T H) )
         Uexp = U.unsqueeze(1)                    # [B,1,r,D]
@@ -433,6 +442,153 @@ class LowRankDynamicKernelOnFeatures(nn.Module):
             "graph_basis": Bmat,      # [N,r]
             "graph_scales": s,        # [B,O,r]
             "graph_mode_proj": U,     # [B,r,D]
+            "graph_alpha": alpha.detach(),
+        }
+        return H_graph, info
+
+
+
+
+class LowRankDirectedKernelOnFeatures(nn.Module):
+    r"""
+    Directed adjacency-free dynamic interaction on features H via a low-rank operator.
+
+    For each horizon o:
+        A(b,o) = P diag(s(b,o)) Q^T,    (rank<=r, generally asymmetric)
+
+    We DO NOT materialize A (N×N). Compute:
+        M = A H = P ( s ⊙ (Q^T H) )     with O(N*r*D).
+
+    Output (module-internal convex update):
+        H_graph = H_base + alpha*(M - H_base), alpha in [0,1].
+
+    Notes:
+      - For directed / signed interactions, we recommend graph_normalize=False.
+      - You can optionally bound s via tanh (cfg.graph_scale_activation="tanh") for stability.
+    """
+
+    def __init__(
+        self,
+        num_features: int,
+        feat_dim: int,
+        rank: int,
+        num_timestamps: int,
+        use_output_timestamps: bool,
+        hidden_size: int,
+        dropout: float,
+        nonnegative_basis: bool,
+        normalize: bool,
+        alpha: float,
+        scale_activation: str = "softplus",
+        scale_bound: float = 1.0,
+        step_emb_dim: int = 0,
+        use_step_embedding: bool = False,
+        eps: float = 1e-6,
+    ):
+        super().__init__()
+        self.N = int(num_features)
+        self.D = int(feat_dim)
+        self.r = int(rank)
+        self.T = int(num_timestamps)
+        self.use_out_ts = bool(use_output_timestamps)
+        self.use_step = bool(use_step_embedding) and int(step_emb_dim) > 0
+        self.S = int(step_emb_dim) if self.use_step else 0
+
+        self.nonneg = bool(nonnegative_basis)
+        self.normalize = bool(normalize)
+        self.eps = float(eps)
+
+        self.scale_act = str(scale_activation).lower()
+        self.scale_bound = float(scale_bound)
+
+        if self.normalize:
+            # directed degree normalization is ambiguous; enforce off to avoid silent instability
+            raise ValueError("graph_normalize=True is not supported for directed operator. Set graph_normalize=False.")
+
+        self.alpha = nn.Parameter(torch.tensor(float(alpha)))
+
+        self._P = nn.Parameter(torch.empty(self.N, self.r))
+        self._Q = nn.Parameter(torch.empty(self.N, self.r))
+        nn.init.xavier_uniform_(self._P)
+        nn.init.xavier_uniform_(self._Q)
+
+        in_dim = self.r + (self.T if self.use_out_ts else 0) + (self.S if self.use_step else 0)
+        self.scale_mlp = nn.Sequential(
+            nn.Linear(in_dim, int(hidden_size)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden_size), self.r),
+        )
+
+    def left_basis(self) -> torch.Tensor:
+        P = torch.nn.functional.softplus(self._P) if self.nonneg else self._P
+        return P
+
+    def right_basis(self) -> torch.Tensor:
+        Q = torch.nn.functional.softplus(self._Q) if self.nonneg else self._Q
+        return Q
+
+    def forward(
+        self,
+        H: torch.Tensor,                               # [B,N,D]
+        ts_out: Optional[torch.Tensor],                # [B,O,T]
+        O: int,
+        step_emb: Optional[torch.Tensor] = None,       # [O,S]
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        if H.ndim != 3:
+            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
+        Bsz, N, D = H.shape
+        if N != self.N or D != self.D:
+            raise ValueError(f"H shape mismatch: got {tuple(H.shape)}, expected [B,{self.N},{self.D}]")
+
+        P = self.left_basis()                          # [N,r]
+        Q = self.right_basis()                         # [N,r]
+
+        U = torch.einsum("bnd,nr->brd", H, Q)           # [B,r,D]
+        ctx = torch.sqrt(torch.mean(U ** 2, dim=-1) + self.eps)  # [B,r]
+
+        feat_parts = []
+        if self.use_out_ts:
+            if ts_out is None:
+                raise ValueError("graph_use_output_timestamps=True but targets_timestamps is None.")
+            if ts_out.shape[0] != Bsz or ts_out.shape[1] != O:
+                raise ValueError(f"targets_timestamps should be [B,O,T], got {tuple(ts_out.shape)}")
+            feat_parts.append(ts_out.float())  # [B,O,T]
+
+        feat_parts.append(ctx.unsqueeze(1).expand(-1, O, -1))  # [B,O,r]
+
+        if self.use_step:
+            if step_emb is None:
+                raise ValueError("use_step_embedding=True but step_emb is None.")
+            if step_emb.shape[0] != O or step_emb.shape[1] != self.S:
+                raise ValueError(f"step_emb should be [O,{self.S}], got {tuple(step_emb.shape)}")
+            se = step_emb.unsqueeze(0).expand(Bsz, -1, -1).to(ctx.dtype)  # [B,O,S]
+            feat_parts.append(se)
+
+        feat = torch.cat(feat_parts, dim=-1)  # [B,O,...]
+        s_raw = self.scale_mlp(feat)          # [B,O,r]
+
+        if self.scale_act == "softplus":
+            s = torch.nn.functional.softplus(s_raw)  # >=0
+        elif self.scale_act == "tanh":
+            s = self.scale_bound * torch.tanh(s_raw)  # signed, bounded
+        else:
+            raise ValueError(f"Unknown graph_scale_activation: {self.scale_act} (expected softplus|tanh)")
+
+        # M = P ( s ⊙ (Q^T H) )
+        Uexp = U.unsqueeze(1)                           # [B,1,r,D]
+        X = s.unsqueeze(-1) * Uexp                      # [B,O,r,D]
+        M = torch.einsum("bord,nr->bond", X, P)         # [B,O,N,D]
+
+        H_base = H.unsqueeze(1).expand(-1, O, -1, -1)
+        alpha = torch.clamp(self.alpha, 0.0, 1.0)
+        H_graph = H_base + alpha * (M - H_base)
+
+        info = {
+            "graph_left_basis": P,
+            "graph_right_basis": Q,
+            "graph_scales": s,
+            "graph_mode_proj": U,
             "graph_alpha": alpha.detach(),
         }
         return H_graph, info
@@ -526,14 +682,109 @@ class ConvexGraphFusion(nn.Module):
         return {"w_base": w_base, "w_graph": w_graph}
 
 
+
+class DynamicPerHorizonFusion(nn.Module):
+    """
+    Dynamic convex fusion weights wg(b,o) in (0,1), conditioned on:
+      - a global context extracted from H (backbone feature)
+      - targets_timestamps ts_out (normalized to [0,1])
+      - optional step embedding
+
+    This addresses the limitation of a single static wg shared across all samples.
+    Output shapes:
+      w_graph: [B,O], w_base: [B,O]
+    """
+
+    def __init__(
+        self,
+        feat_dim: int,
+        num_timestamps: int,
+        num_horizons: int,
+        step_emb_dim: int,
+        use_step_embedding: bool,
+        ctx_dim: int,
+        hidden: int,
+        dropout: float,
+        raw_init: float,
+        w_min: float = 0.0,
+        w_max: float = 1.0,
+    ):
+        super().__init__()
+        self.D = int(feat_dim)
+        self.T = int(num_timestamps)
+        self.O = int(num_horizons)
+        self.S = int(step_emb_dim) if (use_step_embedding and int(step_emb_dim) > 0) else 0
+        self.use_step = self.S > 0
+
+        self.w_min = float(w_min)
+        self.w_max = float(w_max)
+        if not (0.0 <= self.w_min <= self.w_max <= 1.0):
+            raise ValueError(f"fusion_w_min/max must satisfy 0<=min<=max<=1, got {self.w_min},{self.w_max}")
+
+        self.ctx_proj = nn.Linear(self.D, int(ctx_dim), bias=True)
+
+        in_dim = int(ctx_dim) + self.T + (self.S if self.use_step else 0)
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, int(hidden)),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(int(hidden), 1),
+        )
+        # initialize last bias so initial wg roughly matches raw_init mapping
+        with torch.no_grad():
+            self.mlp[-1].bias.fill_(float(raw_init))
+
+    @staticmethod
+    def _softplus_ratio(raw: torch.Tensor) -> torch.Tensor:
+        u = torch.nn.functional.softplus(raw)
+        return u / (1.0 + u)
+
+    def forward(
+        self,
+        H: torch.Tensor,                        # [B,N,D]
+        ts_out: torch.Tensor,                   # [B,O,T]
+        step_emb: Optional[torch.Tensor] = None # [O,S]
+    ) -> Dict[str, torch.Tensor]:
+        if H.ndim != 3:
+            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
+        B, N, D = H.shape
+        if ts_out.ndim != 3 or ts_out.shape[0] != B or ts_out.shape[1] != self.O or ts_out.shape[2] != self.T:
+            raise ValueError(f"targets_timestamps must be [B,O,T]=[{B},{self.O},{self.T}], got {tuple(ts_out.shape)}")
+
+        # global context from H (mean over nodes)
+        ctx = self.ctx_proj(H).mean(dim=1)              # [B,ctx_dim]
+        ctx = ctx.unsqueeze(1).expand(-1, self.O, -1)   # [B,O,ctx_dim]
+
+        parts = [ctx, ts_out.float()]
+        if self.use_step:
+            if step_emb is None:
+                raise ValueError("use_step_embedding=True but step_emb is None.")
+            if step_emb.shape[0] != self.O or step_emb.shape[1] != self.S:
+                raise ValueError(f"step_emb must be [O,S]=[{self.O},{self.S}], got {tuple(step_emb.shape)}")
+            se = step_emb.unsqueeze(0).expand(B, -1, -1).to(ctx.dtype)  # [B,O,S]
+            parts.append(se)
+
+        feat = torch.cat(parts, dim=-1)  # [B,O,in_dim]
+        raw = self.mlp(feat).squeeze(-1) # [B,O]
+
+        wg = self._softplus_ratio(raw)
+        if not (self.w_min == 0.0 and self.w_max == 1.0):
+            wg = self.w_min + (self.w_max - self.w_min) * wg
+        wb = 1.0 - wg
+        return {"w_base": wb, "w_graph": wg}
+
+
 def _expand_weight(w: torch.Tensor, B: int, O: int, N: int, D: int) -> torch.Tensor:
     """
     Expand a weight tensor to [B,O,N,1] (broadcastable to [B,O,N,D]).
+
     Accepted shapes:
       scalar: []
-      per_horizon: [O]
-      per_node: [N]
-      per_node_horizon: [O,N]
+      per_horizon (static): [O]
+      per_node (static): [N]
+      per_node_horizon (static): [O,N]
+      dynamic_per_horizon: [B,O]
+      dynamic_per_node_horizon: [B,O,N]
     """
     if w.ndim == 0:
         return w.view(1, 1, 1, 1).expand(B, O, N, 1)
@@ -543,6 +794,10 @@ def _expand_weight(w: torch.Tensor, B: int, O: int, N: int, D: int) -> torch.Ten
         return w.view(1, 1, N, 1).expand(B, O, N, 1)
     if w.ndim == 2 and w.shape == (O, N):
         return w.view(1, O, N, 1).expand(B, O, N, 1)
+    if w.ndim == 2 and w.shape == (B, O):
+        return w.view(B, O, 1, 1).expand(B, O, N, 1)
+    if w.ndim == 3 and w.shape == (B, O, N):
+        return w.view(B, O, N, 1)
     raise ValueError(f"Unsupported fusion weight shape: {tuple(w.shape)}")
 
 
@@ -550,8 +805,10 @@ def _augment_decoder_features(
     F: torch.Tensor,                      # [B,O,N,D]
     node_emb: Optional[torch.Tensor],     # [N,E]
     step_emb: Optional[torch.Tensor],     # [O,S]
+    ts_out: Optional[torch.Tensor],       # [B,O,T]
     use_node: bool,
     use_step: bool,
+    use_ts: bool,
 ) -> torch.Tensor:
     B, O, N, D = F.shape
     parts = [F]
@@ -561,6 +818,13 @@ def _augment_decoder_features(
     if use_step and (step_emb is not None):
         se = step_emb.view(1, O, 1, -1).expand(B, O, N, -1).to(F.dtype)
         parts.append(se)
+    if use_ts:
+        if ts_out is None:
+            raise ValueError("decoder_use_output_timestamps=True but targets_timestamps is None.")
+        if ts_out.shape[0] != B or ts_out.shape[1] != O:
+            raise ValueError(f"targets_timestamps should be [B,O,T], got {tuple(ts_out.shape)}")
+        te = ts_out.float().unsqueeze(2).expand(B, O, N, -1).to(F.dtype)  # [B,O,N,T]
+        parts.append(te)
     if len(parts) == 1:
         return F
     return torch.cat(parts, dim=-1)
@@ -627,7 +891,11 @@ class MyModel(nn.Module):
         # ---- spatial module ----
         self.graph = None
         if bool(cfg.enable_dynamic_graph):
-            self.graph = LowRankDynamicKernelOnFeatures(
+            gvar = str(getattr(cfg, "graph_variant", "symmetric")).lower()
+            scale_act = str(getattr(cfg, "graph_scale_activation", "softplus")).lower()
+            scale_bound = float(getattr(cfg, "graph_scale_bound", 1.0))
+
+            common_kwargs = dict(
                 num_features=self.N,
                 feat_dim=D,
                 rank=int(cfg.graph_rank),
@@ -638,20 +906,48 @@ class MyModel(nn.Module):
                 nonnegative_basis=bool(cfg.graph_nonnegative_basis),
                 normalize=bool(cfg.graph_normalize),
                 alpha=float(cfg.graph_alpha),
+                scale_activation=scale_act,
+                scale_bound=scale_bound,
                 step_emb_dim=self.step_emb_dim,
                 use_step_embedding=self.step_emb_in_graph and self.step_emb_dim > 0,
             )
 
+            if gvar == "directed":
+                self.graph = LowRankDirectedKernelOnFeatures(**common_kwargs)
+            elif gvar == "symmetric":
+                self.graph = LowRankDynamicKernelOnFeatures(**common_kwargs)
+            else:
+                raise ValueError(f"Unknown graph_variant: {gvar} (expected symmetric|directed)")
+
         # ---- fusion ----
-        self.fusion = ConvexGraphFusion(
-            learnable=bool(cfg.fusion_learnable),
-            raw_init=float(cfg.fusion_raw_init),
-            mode=str(getattr(cfg, "fusion_mode", "global")),
-            num_nodes=self.N,
-            num_horizons=self.O,
-            w_min=float(getattr(cfg, "fusion_w_min", 0.0)),
-            w_max=float(getattr(cfg, "fusion_w_max", 1.0)),
-        )
+        self.fusion_mode = str(getattr(cfg, "fusion_mode", "global")).lower()
+
+        if self.fusion_mode == "dynamic_per_horizon":
+            if not bool(cfg.use_output_timestamps):
+                raise ValueError("fusion_mode=dynamic_per_horizon requires use_output_timestamps=True (need targets_timestamps).")
+            self.fusion = DynamicPerHorizonFusion(
+                feat_dim=D,
+                num_timestamps=self.T,
+                num_horizons=self.O,
+                step_emb_dim=self.step_emb_dim,
+                use_step_embedding=self.step_emb_dim > 0,
+                ctx_dim=int(getattr(cfg, "fusion_dynamic_ctx_dim", 16)),
+                hidden=int(getattr(cfg, "fusion_dynamic_hidden", 64)),
+                dropout=float(getattr(cfg, "fusion_dynamic_dropout", 0.0)),
+                raw_init=float(cfg.fusion_raw_init),
+                w_min=float(getattr(cfg, "fusion_w_min", 0.0)),
+                w_max=float(getattr(cfg, "fusion_w_max", 1.0)),
+            )
+        else:
+            self.fusion = ConvexGraphFusion(
+                learnable=bool(cfg.fusion_learnable),
+                raw_init=float(cfg.fusion_raw_init),
+                mode=self.fusion_mode,
+                num_nodes=self.N,
+                num_horizons=self.O,
+                w_min=float(getattr(cfg, "fusion_w_min", 0.0)),
+                w_max=float(getattr(cfg, "fusion_w_max", 1.0)),
+            )
 
         # ---- time module ----
         self.time_effect = None
@@ -668,11 +964,17 @@ class MyModel(nn.Module):
             )
 
         # ---- decoder heads ----
+        self.decoder_use_ts = bool(getattr(cfg, "decoder_use_output_timestamps", False))
+        if self.decoder_use_ts and (not bool(cfg.use_output_timestamps)):
+            raise ValueError("decoder_use_output_timestamps=True requires use_output_timestamps=True.")
+
         dec_dim = D
         if self.node_emb_dim > 0 and self.node_emb_in_decoder:
             dec_dim += self.node_emb_dim
         if self.step_emb_dim > 0 and self.step_emb_in_decoder:
             dec_dim += self.step_emb_dim
+        if self.decoder_use_ts:
+            dec_dim += self.T
 
         self.mu_head = nn.Linear(dec_dim, 1, bias=True)
 
@@ -805,7 +1107,10 @@ class MyModel(nn.Module):
 
         # (4) fusion weights and fused features
         if self.graph is not None:
-            fw = self.fusion()
+            if self.fusion_mode == "dynamic_per_horizon":
+                fw = self.fusion(H, targets_timestamps, step_emb=step_emb if (self.step_emb is not None) else None)
+            else:
+                fw = self.fusion()
             w_base_raw, w_graph_raw = fw["w_base"], fw["w_graph"]
         else:
             w_base_raw = H.new_tensor(1.0)
@@ -822,8 +1127,10 @@ class MyModel(nn.Module):
             F,
             node_emb=node_emb,
             step_emb=step_emb,
+            ts_out=targets_timestamps if self.decoder_use_ts else None,
             use_node=(self.node_emb is not None and self.node_emb_in_decoder),
             use_step=(self.step_emb is not None and self.step_emb_in_decoder),
+            use_ts=self.decoder_use_ts,
         )
 
         mu_feat = self.mu_head(F_dec).squeeze(-1)  # [B,O,N]
@@ -836,15 +1143,19 @@ class MyModel(nn.Module):
                 H_base,
                 node_emb=node_emb,
                 step_emb=step_emb,
+                ts_out=targets_timestamps if self.decoder_use_ts else None,
                 use_node=(self.node_emb is not None and self.node_emb_in_decoder),
                 use_step=(self.step_emb is not None and self.step_emb_in_decoder),
+                use_ts=self.decoder_use_ts,
             )
             Hg_dec = _augment_decoder_features(
                 H_graph,
                 node_emb=node_emb,
                 step_emb=step_emb,
+                ts_out=targets_timestamps if self.decoder_use_ts else None,
                 use_node=(self.node_emb is not None and self.node_emb_in_decoder),
                 use_step=(self.step_emb is not None and self.step_emb_in_decoder),
+                use_ts=self.decoder_use_ts,
             )
             mu_base = self.mu_head(Hb_dec).squeeze(-1)
             mu_graph = self.mu_head(Hg_dec).squeeze(-1)

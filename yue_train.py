@@ -21,8 +21,10 @@ def main():
         use_input_timestamps=True,
         use_output_timestamps=True,
 
-        node_emb_dim=0,
-        step_emb_dim=0,
+        node_emb_dim=64,
+        step_emb_dim=32,
+        node_emb_dropout=0.1,
+        node_bias=False,
 
         enable_dynamic_graph=True,
         graph_nonnegative_basis=False,
@@ -30,15 +32,16 @@ def main():
         graph_rank=64,
         graph_alpha=0.1,
         graph_scale_hidden_size=256,
-        graph_scale_dropout=0.0,
+        graph_scale_dropout=0.1,
 
-        reg_graph_orth=0.0,
+        reg_graph_orth=1e-4,
         reg_graph_l1=0.0,
         reg_graph_scale_smooth=0.0,
 
         fusion_learnable=True,
+        fusion_mode="per_horizon",
         fusion_raw_init=-1.0,
-        reg_fusion_l1=0.0,
+        reg_fusion_l1=1e-4,
 
         enable_time_effect=True,
         time_tod_harmonics=4,

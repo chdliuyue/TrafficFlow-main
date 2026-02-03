@@ -1,4 +1,3 @@
-
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -20,10 +19,12 @@ class MyModelConfig(BasicTSModelConfig):
       - timestamps are already normalized to [0, 1] BEFORE entering the model.
       - timestamp_sizes (e.g. [288, 7]) is meta-info for the original discrete sizes.
 
-    This config keeps backward compatibility with previous versions, and adds:
+    This config is backward-compatible with previous versions and adds:
       - Node identity embedding (captures node heterogeneity without adjacency).
       - Horizon/step embedding (captures lead-time heterogeneity for multi-step forecasting).
-      - More expressive convex fusion weights (global / per-horizon / per-node / factorized per-node-horizon).
+      - Optional decoder conditioning on output timestamps (ts_out) to model interactions μ(H, t) beyond additive time bias.
+      - More expressive convex fusion weights (static modes + optional dynamic-per-horizon gating).
+      - Optional directed low-rank spatial operator (captures asymmetric influence without building N×N).
     """
 
     # ---- required ----
@@ -56,7 +57,7 @@ class MyModelConfig(BasicTSModelConfig):
     use_output_timestamps: bool = field(default=True)   # used by spatial/time modules
 
     # =========================
-    # NEW: Node/Step identity embeddings (very effective on PEMS07-like datasets)
+    # Identity embeddings (effective on large-N datasets like PEMS07)
     # =========================
     node_emb_dim: int = field(default=0, metadata={"help": "0 disables node embedding; typical: 16/32/64"})
     node_emb_in_backbone: bool = field(default=True, metadata={"help": "concat node embedding to trunk input"})
@@ -70,52 +71,81 @@ class MyModelConfig(BasicTSModelConfig):
     step_emb_in_graph: bool = field(default=True, metadata={"help": "use step embedding in graph scale network"})
 
     # =========================
-    # Module A) Spatial interpretability (adjacency-free, avoids N×N):
-    #   A(b,o) = B diag(s(b,o)) B^T   (PSD if s>=0, rank=r)
+    # NEW: decoder conditioning on output timestamps (ts_out)
+    # =========================
+    decoder_use_output_timestamps: bool = field(
+        default=False,
+        metadata={"help": "if True, concat targets_timestamps (normalized) to decoder features; models μ(H,t) interactions."},
+    )
+
+    # =========================
+    # Module A) Spatial interpretability (adjacency-free, avoids N×N)
     # =========================
     enable_dynamic_graph: bool = field(default=True)
+
+    # operator variant:
+    #   - symmetric:  A = B diag(s) B^T   (PSD if s>=0)
+    #   - directed:   A = P diag(s) Q^T   (asymmetric, captures direction; still O(N*r*D))
+    graph_variant: str = field(default="symmetric", metadata={"help": "symmetric|directed"})
+
     graph_rank: int = field(default=16)
     graph_alpha: float = field(default=0.5)             # convex update coefficient in [0,1]
+
+    # normalization is meaningful mainly for nonnegative symmetric bases; for signed/directed, keep False.
     graph_normalize: bool = field(default=True)
     graph_nonnegative_basis: bool = field(default=True)
+
     graph_use_output_timestamps: bool = field(default=True)
     graph_scale_hidden_size: int = field(default=64)
     graph_scale_dropout: float = field(default=0.0)
 
+    # scale activation controls s(b,o):
+    #   - softplus: s>=0  (default, PSD-style)
+    #   - tanh:     s in [-bound, bound] (signed; useful for directed operator)
+    graph_scale_activation: str = field(default="softplus", metadata={"help": "softplus|tanh"})
+    graph_scale_bound: float = field(default=1.0, metadata={"help": "bound used when activation=tanh"})
+
     # statistical regularization (interpretability / identifiability)
-    reg_graph_orth: float = field(default=0.0)          # encourage B^T B ~ I
-    reg_graph_l1: float = field(default=0.0)            # sparsity of B
+    reg_graph_orth: float = field(default=0.0)          # encourage B^T B ~ I (and P^T P, Q^T Q for directed)
+    reg_graph_l1: float = field(default=0.0)            # sparsity of basis
     reg_graph_scale_smooth: float = field(default=0.0)  # smooth s across horizons
 
     # =========================
     # Fusion (Method A) between {base, graph} under convex constraint:
-    #   F = w0 * H_base + wg * H_graph
-    # with wg in (0,1), w0 = 1-wg
+    #   F = w0 * H_base + wg * H_graph, wg in (0,1), w0=1-wg
     #
-    # NEW: fusion_mode controls the granularity of wg:
+    # fusion_mode (static):
     #   - global:           wg is a scalar
     #   - per_horizon:      wg(o)
     #   - per_node:         wg(n)
-    #   - per_node_horizon: wg(o,n) = sigmoid(raw0 + raw_step[o] + raw_node[n])  (factorized, cheap)
+    #   - per_node_horizon: wg(o,n) = sigmoid(raw0 + raw_step[o] + raw_node[n]) (factorized, cheap)
+    #
+    # fusion_mode (dynamic):
+    #   - dynamic_per_horizon: wg(b,o) = g(H, ts_out, step_emb)  (convex, stable)
     # =========================
     fusion_learnable: bool = field(default=True)
-    fusion_raw_init: float = field(default=0.0)  # init for global raw0 (and step/node start at 0)
+    fusion_raw_init: float = field(default=0.0)
 
     fusion_mode: str = field(
         default="global",
-        metadata={"help": "global|per_horizon|per_node|per_node_horizon"},
+        metadata={"help": "global|per_horizon|per_node|per_node_horizon|dynamic_per_horizon"},
     )
-    fusion_w_min: float = field(default=0.0, metadata={"help": "optional lower bound for wg"})
-    fusion_w_max: float = field(default=1.0, metadata={"help": "optional upper bound for wg"})
-    reg_fusion_l1: float = field(default=0.0)  # note: L1 on convex weights is constant; kept for compatibility
+    fusion_w_min: float = field(default=0.0)
+    fusion_w_max: float = field(default=1.0)
+
+    # for dynamic_per_horizon:
+    fusion_dynamic_ctx_dim: int = field(default=16, metadata={"help": "projected context dim from H for dynamic fusion"})
+    fusion_dynamic_hidden: int = field(default=64, metadata={"help": "hidden size of dynamic fusion MLP"})
+    fusion_dynamic_dropout: float = field(default=0.0)
+
+    # sparsity penalty on w_graph (implemented in myloss)
+    reg_fusion_l1: float = field(default=0.0)
 
     # =========================
-    # Module B) Time interpretability (Fourier basis):
-    #   b_time(b,o,n) = <c_tod(H,n,step), phi_tod(tod_{b,o})> + <c_dow(H,n,step), phi_dow(dow_{b,o})>
+    # Module B) Time interpretability (Fourier basis)
     # =========================
     enable_time_effect: bool = field(default=True)
 
-    # number of Fourier harmonics (k=1..K)
     time_tod_harmonics: int = field(default=4)
     time_dow_harmonics: int = field(default=2)
 
@@ -132,15 +162,12 @@ class MyModelConfig(BasicTSModelConfig):
         metadata={"help": "none|gaussian|studentt|laplace|quantile|lognormal|gamma|negbinom"},
     )
 
-    # scale head params
     min_scale: float = field(default=1e-3)
 
-    # student-t df
     studentt_df_mode: str = field(default="learned_global", metadata={"help": "fixed|learned_global"})
     studentt_df_init: float = field(default=10.0)
     studentt_df_min: float = field(default=2.1)
 
-    # quantile
     quantiles: Sequence[float] = field(default=(0.1, 0.5, 0.9))
     quantile_monotone: bool = field(default=True)
     quantile_pred_level: float = field(default=0.5)
@@ -156,8 +183,7 @@ class MyModelConfig(BasicTSModelConfig):
 
     loss_eps: float = field(default=1e-6)
     loss_check_domain: bool = field(default=True)
-
-    compute_loss_in_forward: bool = field(default=True)  # runner reads forward_return["loss"]
+    compute_loss_in_forward: bool = field(default=True)
 
     # ---- outputs ----
     return_distribution: bool = field(default=True)
