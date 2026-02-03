@@ -1296,8 +1296,19 @@ class MyModel(nn.Module):
             # regularization signals
             loss_inputs["fusion_weights"] = {"w_base": w_base_raw, "w_graph": w_graph_raw}
             if self.graph is not None:
-                loss_inputs["graph_basis"] = graph_info["graph_basis"]
-                loss_inputs["graph_scales"] = graph_info["graph_scales"]
+                # support both symmetric and directed graph variants
+                if "graph_basis" in graph_info:
+                    # symmetric PSD kernel
+                    loss_inputs["graph_basis"] = graph_info["graph_basis"]
+                else:
+                    # directed kernel: P/Q bases
+                    if "graph_left_basis" in graph_info:
+                        loss_inputs["graph_left_basis"] = graph_info["graph_left_basis"]
+                    if "graph_right_basis" in graph_info:
+                        loss_inputs["graph_right_basis"] = graph_info["graph_right_basis"]
+
+                if "graph_scales" in graph_info:
+                    loss_inputs["graph_scales"] = graph_info["graph_scales"]
 
             loss_dict = compute_total_loss(
                 outputs=loss_inputs,
