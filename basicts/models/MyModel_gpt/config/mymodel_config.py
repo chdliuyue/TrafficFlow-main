@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 from typing import Sequence
 
@@ -7,185 +8,134 @@ from basicts.configs import BasicTSModelConfig
 @dataclass
 class MyModelConfig(BasicTSModelConfig):
     """
-    MyModel config (Backbone-H + Spatial/Time/Distribution modules + Convex Fusion).
+    Core architecture config for traffic flow forecasting:
 
-    Fixed shapes in BasicTS:
+    Backbone (mid-layer) feature H  -> 3 parallel branches
+      1) H itself (base branch)
+      2) Spatial explainable branch (low-rank relation, avoids N×N)
+      3) Temporal explainable branch (novel spectral-token attention)
+
+    Then convex residual fusion (stable, interpretable), and a statistical distribution head
+    with NLL loss (Part C: probabilistic, distribution-aware forecasting).
+
+    Shapes:
       inputs:             [B, L, N]
       targets:            [B, O, N]
-      inputs_timestamps:  [B, L, T]
-      targets_timestamps: [B, O, T]
+      inputs_timestamps:  [B, L, T]   (normalized to [0,1])
+      targets_timestamps: [B, O, T]   (normalized to [0,1])
 
-    Timestamp convention in this project:
-      - timestamps are already normalized to [0, 1] BEFORE entering the model.
-      - timestamp_sizes (e.g. [288, 7]) is meta-info for the original discrete sizes.
-
-    This config is backward-compatible with previous versions and adds:
-      - Node identity embedding (captures node heterogeneity without adjacency).
-      - Horizon/step embedding (captures lead-time heterogeneity for multi-step forecasting).
-      - Optional decoder conditioning on output timestamps (ts_out) to model interactions μ(H, t) beyond additive time bias.
-      - More expressive convex fusion weights (static modes + optional dynamic-per-horizon gating).
-      - Optional directed low-rank spatial operator (captures asymmetric influence without building N×N).
+    Notes for traffic engineers:
+      - spatial branch learns low-rank network co-movement modes (r << N), not an explicit adjacency.
+      - temporal branch attends over *periodic spectral tokens* (daily/weekly harmonics), giving
+        interpretable weights over periodicities.
+      - distribution head models heteroscedastic uncertainty (per node, per horizon), e.g. Student-t.
     """
 
     # ---- required ----
-    input_len: int = field(default=None)
-    output_len: int = field(default=None)
-    num_features: int = field(default=None)     # number of nodes N
-    num_timestamps: int = field(default=2)      # e.g. T=2: [tod_norm, dow_norm]
-
-    # meta only (timestamps already normalized)
-    timestamp_sizes: Sequence[int] = field(default=(288, 7))
+    input_len: int = field(default=None)        # L
+    output_len: int = field(default=None)       # O
+    num_features: int = field(default=None)     # N
+    num_timestamps: int = field(default=2)      # T (e.g., [tod_norm, dow_norm])
+    timestamp_sizes: Sequence[int] = field(default=(288, 7))  # meta only
 
     # ---- preprocessing ----
     last_value_centering: bool = field(default=True)
-    dropout: float = field(default=0.0)
 
-    # ---- trunk backbone ----
-    backbone_type: str = field(default="gru", metadata={"help": "lstm|gru|transformer"})
+    # ============================================================
+    # Backbone (flexible): GRU / LSTM / Transformer
+    # ============================================================
+    backbone_type: str = field(default="gru", metadata={"help": "gru|lstm|transformer"})
+    backbone_hidden_size: int = field(default=256)   # D
     backbone_layers: int = field(default=2)
-    backbone_hidden_size: int = field(default=64)
-    backbone_dropout: float = field(default=0.0)
+    backbone_dropout: float = field(default=0.1)
+    backbone_tap_layer: int = field(
+        default=-1,
+        metadata={"help": "which layer's final hidden to branch from; -1 means last layer"},
+    )
 
-    # transformer-only knobs
+    # input conditioning
+    use_input_timestamps: bool = field(default=True)
+
+    # transformer-only knobs (only used if backbone_type='transformer')
     transformer_nhead: int = field(default=4)
     transformer_ffn_ratio: float = field(default=4.0)
     transformer_norm_first: bool = field(default=True)
     transformer_use_positional_encoding: bool = field(default=True)
 
-    # ---- timestamps usage ----
-    use_input_timestamps: bool = field(default=False)   # concat to backbone input
-    use_output_timestamps: bool = field(default=True)   # used by spatial/time modules
+    # ============================================================
+    # Identity embeddings (strong for large-N traffic networks)
+    # ============================================================
+    node_emb_dim: int = field(default=64)   # set 0 to disable
+    step_emb_dim: int = field(default=32)   # set 0 to disable
+    dropout: float = field(default=0.1)     # shared dropout for embeddings/decoder
 
-    # =========================
-    # Identity embeddings (effective on large-N datasets like PEMS07)
-    # =========================
-    node_emb_dim: int = field(default=0, metadata={"help": "0 disables node embedding; typical: 16/32/64"})
-    node_emb_in_backbone: bool = field(default=True, metadata={"help": "concat node embedding to trunk input"})
-    node_emb_in_decoder: bool = field(default=True, metadata={"help": "concat node embedding to decoder input"})
-    node_emb_dropout: float = field(default=0.0)
-    node_bias: bool = field(default=False, metadata={"help": "add a learnable node-wise bias to output mean"})
+    # ============================================================
+    # Branch 1) Spatial explainability: low-rank relation (avoid N×N)
+    #   A(b,o) = B diag(s(b,o)) B^T   (rank=r, s>=0)
+    #   compute AH without forming N×N:  B ( s ⊙ (B^T H) )
+    # ============================================================
+    enable_spatial: bool = field(default=True)
+    spatial_rank: int = field(default=64)            # r
+    spatial_alpha: float = field(default=0.1)        # residual strength
+    spatial_scale_hidden: int = field(default=256)
+    spatial_scale_dropout: float = field(default=0.1)
+    reg_spatial_orth: float = field(default=1e-4)    # stabilize signed/no-normalize regime
+    spatial_use_output_timestamps: bool = field(default=True)
 
-    step_emb_dim: int = field(default=0, metadata={"help": "0 disables horizon/step embedding; typical: 8/16/32"})
-    step_emb_in_decoder: bool = field(default=True, metadata={"help": "concat step embedding to decoder input"})
-    step_emb_in_time: bool = field(default=True, metadata={"help": "use step embedding to modulate time coefficients"})
-    step_emb_in_graph: bool = field(default=True, metadata={"help": "use step embedding in graph scale network"})
-
-    # =========================
-    # NEW: decoder conditioning on output timestamps (ts_out)
-    # =========================
-    decoder_use_output_timestamps: bool = field(
-        default=False,
-        metadata={"help": "if True, concat targets_timestamps (normalized) to decoder features; models μ(H,t) interactions."},
-    )
-
-    # =========================
-    # Module A) Spatial interpretability (adjacency-free, avoids N×N)
-    # =========================
-    enable_dynamic_graph: bool = field(default=True)
-
-    # operator variant:
-    #   - symmetric:  A = B diag(s) B^T   (PSD if s>=0)
-    #   - directed:   A = P diag(s) Q^T   (asymmetric, captures direction; still O(N*r*D))
-    graph_variant: str = field(default="symmetric", metadata={"help": "symmetric|directed"})
-
-    graph_rank: int = field(default=16)
-    graph_alpha: float = field(default=0.5)             # convex update coefficient in [0,1]
-
-    # normalization is meaningful mainly for nonnegative symmetric bases; for signed/directed, keep False.
-    graph_normalize: bool = field(default=True)
-    graph_nonnegative_basis: bool = field(default=True)
-
-    graph_use_output_timestamps: bool = field(default=True)
-    graph_scale_hidden_size: int = field(default=64)
-    graph_scale_dropout: float = field(default=0.0)
-
-    # scale activation controls s(b,o):
-    #   - softplus: s>=0  (default, PSD-style)
-    #   - tanh:     s in [-bound, bound] (signed; useful for directed operator)
-    graph_scale_activation: str = field(default="softplus", metadata={"help": "softplus|tanh"})
-    graph_scale_bound: float = field(default=1.0, metadata={"help": "bound used when activation=tanh"})
-
-    # statistical regularization (interpretability / identifiability)
-    reg_graph_orth: float = field(default=0.0)          # encourage B^T B ~ I (and P^T P, Q^T Q for directed)
-    reg_graph_l1: float = field(default=0.0)            # sparsity of basis
-    reg_graph_scale_smooth: float = field(default=0.0)  # smooth s across horizons
-
-    # =========================
-    # Fusion (Method A) between {base, graph} under convex constraint:
-    #   F = w0 * H_base + wg * H_graph, wg in (0,1), w0=1-wg
-    #
-    # fusion_mode (static):
-    #   - global:           wg is a scalar
-    #   - per_horizon:      wg(o)
-    #   - per_node:         wg(n)
-    #   - per_node_horizon: wg(o,n) = sigmoid(raw0 + raw_step[o] + raw_node[n]) (factorized, cheap)
-    #
-    # fusion_mode (dynamic):
-    #   - dynamic_per_horizon: wg(b,o) = g(H, ts_out, step_emb)  (convex, stable)
-    # =========================
-    fusion_learnable: bool = field(default=True)
-    fusion_raw_init: float = field(default=0.0)
-
-    fusion_mode: str = field(
-        default="global",
-        metadata={"help": "global|per_horizon|per_node|per_node_horizon|dynamic_per_horizon"},
-    )
-    fusion_w_min: float = field(default=0.0)
-    fusion_w_max: float = field(default=1.0)
-
-    # for dynamic_per_horizon:
-    fusion_dynamic_ctx_dim: int = field(default=16, metadata={"help": "projected context dim from H for dynamic fusion"})
-    fusion_dynamic_hidden: int = field(default=64, metadata={"help": "hidden size of dynamic fusion MLP"})
-    fusion_dynamic_dropout: float = field(default=0.0)
-
-    # sparsity penalty on w_graph (implemented in myloss)
-    reg_fusion_l1: float = field(default=0.0)
-
-    # =========================
-    # Module B) Time interpretability (Fourier basis)
-    # =========================
-    enable_time_effect: bool = field(default=True)
-
+    # ============================================================
+    # Branch 2) Temporal explainability (NEW): Spectral-Token Attention
+    #   - tokens = {daily harmonics} U {weekly harmonics}
+    #   - attention weights are interpretable contributions of periodicities
+    # ============================================================
+    enable_time: bool = field(default=True)
     time_tod_harmonics: int = field(default=4)
     time_dow_harmonics: int = field(default=2)
+    time_attn_dim: int = field(default=64)
+    time_alpha: float = field(default=1.0)            # residual strength
+    time_gate_bound: float = field(default=1.0)       # gate is tanh(.) * bound
 
-    # coefficients network on H:
-    #   if 0 -> linear map D->P; if >0 -> 2-layer MLP with this hidden size.
-    time_coef_hidden: int = field(default=0)
-    time_coef_dropout: float = field(default=0.0)
+    # ============================================================
+    # Convex residual fusion (stable):
+    #   F = w0*H_base + ws*H_spatial + wt*H_time
+    #   w0,ws,wt>0, w0+ws+wt=1  (convex constraint)
+    # ============================================================
+    fusion_learnable: bool = field(default=True)
+    fusion_raw_spatial_init: float = field(default=-1.0)
+    fusion_raw_time_init: float = field(default=-1.0)
 
-    # =========================
-    # Module C) Distribution interpretability (learn distribution parameters)
-    # =========================
+    # ============================================================
+    # Decoder + optional linear skip (strong baseline)
+    # ============================================================
+    decoder_mlp_hidden: int = field(default=256)       # 0 -> linear
+    decoder_use_output_timestamps: bool = field(default=True)
+    enable_linear_skip: bool = field(default=True)
+
+    # ============================================================
+    # Distribution head + statistical loss (Part C)
+    # ============================================================
     likelihood: str = field(
-        default="gaussian",
-        metadata={"help": "none|gaussian|studentt|laplace|quantile|lognormal|gamma|negbinom"},
+        default="studentt",
+        metadata={"help": "none|gaussian|studentt|quantile"},
     )
+    min_scale: float = field(default=0.01)            # prevents NLL explosion when scale -> 0
 
-    min_scale: float = field(default=1e-3)
-
+    # student-t df
     studentt_df_mode: str = field(default="learned_global", metadata={"help": "fixed|learned_global"})
     studentt_df_init: float = field(default=10.0)
     studentt_df_min: float = field(default=2.1)
 
+    # quantile regression
     quantiles: Sequence[float] = field(default=(0.1, 0.5, 0.9))
-    quantile_monotone: bool = field(default=True)
-    quantile_pred_level: float = field(default=0.5)
-    quantile_crossing_penalty: float = field(default=0.0)
 
-    # =========================
-    # Training loss (computed inside model.forward for runner compatibility)
-    # =========================
-    point_loss: str = field(default="mae")              # mae|mse|huber
+    # loss weights
+    point_loss: str = field(default="mae", metadata={"help": "mae|mse|huber"})
     huber_delta: float = field(default=1.0)
     lambda_point: float = field(default=1.0)
-    lambda_nll: float = field(default=1.0)
+    lambda_nll: float = field(default=0.1)
 
-    loss_eps: float = field(default=1e-6)
-    loss_check_domain: bool = field(default=True)
+    # runner compatibility
     compute_loss_in_forward: bool = field(default=True)
 
-    # ---- outputs ----
-    return_distribution: bool = field(default=True)
-    return_interpretation: bool = field(default=True)
-    return_components: bool = field(default=True)
+    # outputs (debug / paper analysis)
+    return_interpretation: bool = field(default=False)
+    return_components: bool = field(default=False)

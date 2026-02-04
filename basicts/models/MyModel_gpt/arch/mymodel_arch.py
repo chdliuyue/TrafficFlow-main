@@ -1,1057 +1,628 @@
 
 import math
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 
 import torch
 from torch import nn
 
 from ..config.mymodel_config import MyModelConfig
-from ....metrics.myloss import RegWeights, compute_total_loss
 
 
-# =========================================================
-# Backbone: stacked LSTM/GRU/Transformer over time (shared across nodes)
-# =========================================================
+# ============================================================
+# Mask helpers (same spirit as your MAE reference)
+# ============================================================
 
-class SinusoidalPositionalEncoding(nn.Module):
-    """Classic sinusoidal positional encoding (batch_first=True)."""
-
-    def __init__(self, d_model: int, max_len: int):
-        super().__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2, dtype=torch.float) * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe, persistent=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        L = x.size(1)
-        return x + self.pe[:L].unsqueeze(0).to(x.dtype)
+def _normalize_mask(mask: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    mask = mask.float()
+    mask = mask / (mask.mean() + eps)
+    mask = torch.nan_to_num(mask, nan=0.0, posinf=0.0, neginf=0.0)
+    return mask
 
 
-class NodeTemporalBackbone(nn.Module):
+def masked_mean(x: torch.Tensor, mask: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+    if mask is None:
+        return torch.mean(x)
+    m = _normalize_mask(mask, eps=eps)
+    y = x * m
+    y = torch.nan_to_num(y, nan=0.0, posinf=0.0, neginf=0.0)
+    return torch.mean(y)
+
+
+def masked_mae(pred: torch.Tensor, true: torch.Tensor, mask: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+    return masked_mean(torch.abs(pred - true), mask, eps=eps)
+
+
+def masked_mse(pred: torch.Tensor, true: torch.Tensor, mask: Optional[torch.Tensor], eps: float = 1e-6) -> torch.Tensor:
+    return masked_mean((pred - true) ** 2, mask, eps=eps)
+
+
+def masked_huber(pred: torch.Tensor, true: torch.Tensor, mask: Optional[torch.Tensor], delta: float = 1.0, eps: float = 1e-6) -> torch.Tensor:
+    err = pred - true
+    abs_err = torch.abs(err)
+    quad = torch.minimum(abs_err, abs_err.new_tensor(delta))
+    lin = abs_err - quad
+    loss = 0.5 * quad ** 2 + delta * lin
+    return masked_mean(loss, mask, eps=eps)
+
+
+# ============================================================
+# Distribution NLLs (Part C)
+# ============================================================
+
+def gaussian_nll(y: torch.Tensor, mu: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    # per-element nll
+    var = scale ** 2
+    return 0.5 * (math.log(2.0 * math.pi) + torch.log(var) + (y - mu) ** 2 / var)
+
+
+def studentt_nll(y: torch.Tensor, mu: torch.Tensor, scale: torch.Tensor, df: torch.Tensor) -> torch.Tensor:
+    # Student-t NLL, per-element
+    # nll = log(scale) + 0.5*(df+1)*log(1 + ((y-mu)^2)/(df*scale^2)) + const(df)
+    z2 = ((y - mu) / scale) ** 2
+    df = torch.clamp(df, min=2.0 + 1e-6)
+    const = torch.lgamma((df + 1.0) / 2.0) - torch.lgamma(df / 2.0) - 0.5 * torch.log(df * math.pi)
+    return -const + torch.log(scale) + 0.5 * (df + 1.0) * torch.log1p(z2 / df)
+
+
+def quantile_loss(y: torch.Tensor, q_pred: torch.Tensor, q: float) -> torch.Tensor:
+    # pinball loss
+    e = y - q_pred
+    return torch.maximum((q - 1.0) * e, q * e)
+
+
+# ============================================================
+# Fourier basis utilities
+# ============================================================
+
+def _fourier_sincos(x: torch.Tensor, k: int) -> torch.Tensor:
+    ang = 2.0 * math.pi * float(k) * x
+    return torch.stack([torch.sin(ang), torch.cos(ang)], dim=-1)  # [...,2]
+
+
+# ============================================================
+# Backbone implementations
+# ============================================================
+
+class RNNBackbone(nn.Module):
     """
-    Shared temporal backbone across nodes.
-
-    Inputs:
-      values:    [B, L, N]
-      ts_in:     [B, L, T] (optional, already normalized to [0,1])
-      node_emb:  [N, E]    (optional; used iff cfg.node_emb_in_backbone=True and E>0)
-
-    Output:
-      H: [B, N, D]  (node-wise trunk representation)
+    Shared GRU/LSTM across nodes.
+    Input:  [B,L,N] (+ optional ts_in [B,L,T]) (+ optional node_emb [N,E])
+    Output: H_layers [num_layers,B,N,D]
     """
-
-    def __init__(self, cfg: MyModelConfig):
+    def __init__(self, rnn_type: str, L: int, N: int, T: int, in_extra: int, D: int, layers: int, dropout: float, use_ts: bool):
         super().__init__()
-        self.cfg = cfg
-        self.L = int(cfg.input_len)
-        self.N = int(cfg.num_features)
-        self.T = int(cfg.num_timestamps)
+        self.rnn_type = rnn_type
+        self.L, self.N, self.T = int(L), int(N), int(T)
+        self.D, self.layers = int(D), int(layers)
+        self.use_ts = bool(use_ts)
 
-        self.use_in_ts = bool(cfg.use_input_timestamps)
-        self.node_in = bool(getattr(cfg, "node_emb_in_backbone", True)) and int(getattr(cfg, "node_emb_dim", 0)) > 0
-        self.node_emb_dim = int(getattr(cfg, "node_emb_dim", 0))
-
-        in_dim = 1 + (self.T if self.use_in_ts else 0) + (self.node_emb_dim if self.node_in else 0)
-
-        btype = str(cfg.backbone_type).lower()
-        self.backbone_type = btype
-        D = int(cfg.backbone_hidden_size)
-        layers = int(cfg.backbone_layers)
-        drop = float(cfg.backbone_dropout)
-
-        if btype in {"lstm", "gru"}:
-            rnn_cls = nn.LSTM if btype == "lstm" else nn.GRU
-            self.rnn = rnn_cls(
+        in_dim = 1 + (self.T if self.use_ts else 0) + int(in_extra)
+        if rnn_type == "gru":
+            self.rnn = nn.GRU(
                 input_size=in_dim,
-                hidden_size=D,
-                num_layers=layers,
-                dropout=drop if layers > 1 else 0.0,
+                hidden_size=self.D,
+                num_layers=self.layers,
+                dropout=float(dropout) if self.layers > 1 else 0.0,
                 batch_first=True,
             )
-            self.input_proj = None
-            self.pe = None
-            self.transformer = None
-
-        elif btype == "transformer":
-            self.rnn = None
-            self.input_proj = nn.Linear(in_dim, D)
-            self.pe = SinusoidalPositionalEncoding(d_model=D, max_len=self.L) if bool(cfg.transformer_use_positional_encoding) else nn.Identity()
-
-            nhead = int(cfg.transformer_nhead)
-            ffn_dim = int(D * float(cfg.transformer_ffn_ratio))
-            enc_layer = nn.TransformerEncoderLayer(
-                d_model=D,
-                nhead=nhead,
-                dim_feedforward=ffn_dim,
-                dropout=drop,
-                activation="gelu",
+        elif rnn_type == "lstm":
+            self.rnn = nn.LSTM(
+                input_size=in_dim,
+                hidden_size=self.D,
+                num_layers=self.layers,
+                dropout=float(dropout) if self.layers > 1 else 0.0,
                 batch_first=True,
-                norm_first=bool(cfg.transformer_norm_first),
             )
-            self.transformer = nn.TransformerEncoder(enc_layer, num_layers=layers)
-
         else:
-            raise ValueError(f"Unknown backbone_type: {btype} (expected lstm|gru|transformer).")
+            raise ValueError(f"Unsupported rnn_type: {rnn_type}")
 
-        self.out_dim = D
-
-    def forward(self, values: torch.Tensor, ts_in: Optional[torch.Tensor], node_emb: Optional[torch.Tensor] = None) -> torch.Tensor:
-        if values.ndim != 3:
-            raise ValueError(f"Expected values [B,L,N], got {tuple(values.shape)}")
-        B, L, N = values.shape
-        if L != self.L or N != self.N:
-            raise ValueError(f"Input shape mismatch: got L={L},N={N}, expected L={self.L},N={self.N}")
-
-        # per-node sequence: [B,N,L,1]
-        v = values.permute(0, 2, 1).unsqueeze(-1)
+    def forward(self, x: torch.Tensor, ts_in: Optional[torch.Tensor], node_feat: Optional[torch.Tensor]) -> torch.Tensor:
+        B, L, N = x.shape
+        v = x.permute(0, 2, 1).unsqueeze(-1)  # [B,N,L,1]
 
         feats = [v]
-
-        if self.use_in_ts:
+        if self.use_ts:
             if ts_in is None:
                 raise ValueError("use_input_timestamps=True but inputs_timestamps is None.")
-            if ts_in.shape[:2] != (B, L):
-                raise ValueError(f"inputs_timestamps should be [B,L,T], got {tuple(ts_in.shape)}")
-            ts = ts_in.unsqueeze(1).expand(-1, N, -1, -1).float()
+            ts = ts_in.float().unsqueeze(1).expand(-1, N, -1, -1)  # [B,N,L,T]
             feats.append(ts)
+        if node_feat is not None:
+            # node_feat: [N,E] -> [B,N,L,E]
+            nf = node_feat.unsqueeze(0).unsqueeze(2).expand(B, N, L, -1)
+            feats.append(nf)
 
-        if self.node_in:
-            if node_emb is None:
-                raise ValueError("node_emb_in_backbone=True but node_emb is None.")
-            if node_emb.shape[0] != N or node_emb.shape[1] != self.node_emb_dim:
-                raise ValueError(f"node_emb should be [N,{self.node_emb_dim}], got {tuple(node_emb.shape)}")
-            ne = node_emb.unsqueeze(0).unsqueeze(2).expand(B, N, L, -1).to(v.dtype)
-            feats.append(ne)
+        inp = torch.cat(feats, dim=-1)          # [B,N,L,in_dim]
+        inp = inp.reshape(B * N, L, inp.size(-1))
 
-        x = torch.cat(feats, dim=-1)  # [B,N,L,in_dim]
-        x = x.reshape(B * N, L, x.size(-1))  # [B*N,L,in_dim]
+        if self.rnn_type == "gru":
+            _, h = self.rnn(inp)  # [layers, B*N, D]
+        else:
+            _, (h, _) = self.rnn(inp)  # [layers, B*N, D]
 
-        if self.backbone_type in {"lstm", "gru"}:
-            _, h = self.rnn(x)
-            if self.backbone_type == "lstm":
-                h_last = h[0][-1]  # [B*N,D]
-            else:
-                h_last = h[-1]
-            return h_last.reshape(B, N, -1)
-
-        z = self.input_proj(x)
-        z = self.pe(z)
-        z = self.transformer(z)  # [B*N,L,D]
-        h_last = z[:, -1, :]
-        return h_last.reshape(B, N, -1)
+        h = h.reshape(self.layers, B, N, self.D)  # [layers,B,N,D]
+        return h
 
 
-# =========================================================
-# Module B) Time interpretability: Fourier basis (+ optional step FiLM)
-# =========================================================
-
-class FourierTimeEffect(nn.Module):
-    r"""
-    Time effect with a fixed Fourier basis and state-conditioned coefficients:
-
-      b_time(b,o,n) = <c_tod(b,n;H), phi_tod(tod_{b,o})> + <c_dow(b,n;H), phi_dow(dow_{b,o})>
-
-    Optional step embedding modulation (FiLM) upgrades it to:
-      c_tod(b,o,n) = c_state(b,n) ⊙ (1 + s_step(o)) + b_step(o)
-
-    This keeps interpretability:
-      - phi_* are explicit sine/cosine bases (periodic, mean-zero).
-      - coefficients are decomposable into (state part) and (horizon part).
-    """
-
-    def __init__(
-        self,
-        feat_dim: int,
-        node_emb_dim: int,
-        step_emb_dim: int,
-        K_tod: int,
-        K_dow: int,
-        coef_hidden: int = 0,
-        dropout: float = 0.0,
-        use_step_film: bool = True,
-    ):
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model: int, max_len: int = 512):
         super().__init__()
-        self.D = int(feat_dim)
-        self.E = int(node_emb_dim)
-        self.S = int(step_emb_dim)
-        self.K_tod = int(K_tod)
-        self.K_dow = int(K_dow)
-        self.use_step_film = bool(use_step_film) and self.S > 0
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len).unsqueeze(1).float()
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe.unsqueeze(0), persistent=False)  # [1,max_len,d_model]
 
-        self.in_dim = self.D + (self.E if self.E > 0 else 0)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B,L,D]
+        L = x.size(1)
+        return x + self.pe[:, :L, :]
 
-        P_tod = 2 * self.K_tod
-        P_dow = 2 * self.K_dow
-        self.P_tod = P_tod
-        self.P_dow = P_dow
 
-        def make_coef_net(P: int):
-            if P == 0:
-                return None
-            if int(coef_hidden) <= 0:
-                return nn.Linear(self.in_dim, P, bias=True)
-            return nn.Sequential(
-                nn.Linear(self.in_dim, int(coef_hidden)),
-                nn.GELU(),
-                nn.Dropout(float(dropout)),
-                nn.Linear(int(coef_hidden), P),
+class TransformerBackbone(nn.Module):
+    """
+    Shared Transformer encoder across nodes.
+    Input:  [B,L,N] (+ optional ts_in [B,L,T]) (+ optional node_emb [N,E])
+    Output: H_layers [num_layers,B,N,D] where each layer provides the last-token rep.
+    """
+    def __init__(self, L: int, N: int, T: int, in_extra: int, D: int, layers: int,
+                 nhead: int, ffn_ratio: float, dropout: float, norm_first: bool, use_pe: bool, use_ts: bool):
+        super().__init__()
+        self.L, self.N, self.T = int(L), int(N), int(T)
+        self.D, self.layers = int(D), int(layers)
+        self.use_ts = bool(use_ts)
+        in_dim = 1 + (self.T if self.use_ts else 0) + int(in_extra)
+
+        self.in_proj = nn.Linear(in_dim, self.D)
+        self.use_pe = bool(use_pe)
+        self.pe = PositionalEncoding(self.D, max_len=max(512, self.L)) if self.use_pe else None
+
+        dim_ff = int(self.D * float(ffn_ratio))
+        self.blocks = nn.ModuleList([
+            nn.TransformerEncoderLayer(
+                d_model=self.D,
+                nhead=int(nhead),
+                dim_feedforward=dim_ff,
+                dropout=float(dropout),
+                activation="gelu",
+                batch_first=True,
+                norm_first=bool(norm_first),
             )
+            for _ in range(self.layers)
+        ])
 
-        self.coef_tod = make_coef_net(P_tod)
-        self.coef_dow = make_coef_net(P_dow)
+    def forward(self, x: torch.Tensor, ts_in: Optional[torch.Tensor], node_feat: Optional[torch.Tensor]) -> torch.Tensor:
+        B, L, N = x.shape
+        v = x.permute(0, 2, 1).unsqueeze(-1)  # [B,N,L,1]
 
-        # step FiLM: scale/shift per horizon
-        if self.use_step_film and P_tod > 0:
-            self.step_scale_tod = nn.Linear(self.S, P_tod, bias=True)
-            self.step_shift_tod = nn.Linear(self.S, P_tod, bias=True)
-        else:
-            self.step_scale_tod = None
-            self.step_shift_tod = None
+        feats = [v]
+        if self.use_ts:
+            if ts_in is None:
+                raise ValueError("use_input_timestamps=True but inputs_timestamps is None.")
+            ts = ts_in.float().unsqueeze(1).expand(-1, N, -1, -1)  # [B,N,L,T]
+            feats.append(ts)
+        if node_feat is not None:
+            nf = node_feat.unsqueeze(0).unsqueeze(2).expand(B, N, L, -1)
+            feats.append(nf)
 
-        if self.use_step_film and P_dow > 0:
-            self.step_scale_dow = nn.Linear(self.S, P_dow, bias=True)
-            self.step_shift_dow = nn.Linear(self.S, P_dow, bias=True)
-        else:
-            self.step_scale_dow = None
-            self.step_shift_dow = None
+        inp = torch.cat(feats, dim=-1)  # [B,N,L,in_dim]
+        inp = inp.reshape(B * N, L, inp.size(-1))
+        h = self.in_proj(inp)  # [B*N,L,D]
+        if self.pe is not None:
+            h = self.pe(h)
 
-    @staticmethod
-    def _fourier_basis(x: torch.Tensor, K: int) -> torch.Tensor:
-        """
-        x: [B,O] in [0,1]
-        returns: [B,O,2K] = [sin(2πkx), cos(2πkx)]_{k=1..K}
-        """
-        if K <= 0:
-            return x.new_zeros((*x.shape, 0))
-        ks = torch.arange(1, K + 1, device=x.device, dtype=x.dtype).view(1, 1, K)  # [1,1,K]
-        ang = 2.0 * math.pi * x.unsqueeze(-1) * ks                                  # [B,O,K]
-        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)                  # [B,O,2K]
+        outs: List[torch.Tensor] = []
+        for blk in self.blocks:
+            h = blk(h)  # [B*N,L,D]
+            outs.append(h[:, -1, :])  # last token rep [B*N,D]
 
-    def forward(
-        self,
-        H: torch.Tensor,                        # [B,N,D]
-        ts_out: torch.Tensor,                   # [B,O,T], T>=2
-        node_emb: Optional[torch.Tensor] = None,  # [N,E]
-        step_emb: Optional[torch.Tensor] = None,  # [O,S]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if ts_out is None:
-            raise ValueError("targets_timestamps is required for time effect.")
-        if H.ndim != 3:
-            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
-        B, N, D = H.shape
-        Bt, O, T = ts_out.shape
-        if Bt != B:
-            raise ValueError("Batch mismatch between H and targets_timestamps")
-        if T < 2:
-            raise ValueError("FourierTimeEffect expects at least 2 timestamp dims: [tod_norm, dow_norm].")
-
-        tod = ts_out[..., 0].float()  # [B,O]
-        dow = ts_out[..., 1].float()  # [B,O]
-
-        basis_tod = self._fourier_basis(tod, self.K_tod)  # [B,O,P_tod]
-        basis_dow = self._fourier_basis(dow, self.K_dow)  # [B,O,P_dow]
-
-        # build H_aug = [H, node_emb]
-        H_aug = H
-        if self.E > 0:
-            if node_emb is None:
-                raise ValueError("node_emb_dim>0 but node_emb is None for time effect.")
-            if node_emb.shape[0] != N or node_emb.shape[1] != self.E:
-                raise ValueError(f"node_emb should be [N,{self.E}], got {tuple(node_emb.shape)}")
-            ne = node_emb.unsqueeze(0).expand(B, -1, -1).to(H.dtype)
-            H_aug = torch.cat([H, ne], dim=-1)
-
-        time_tod = H.new_zeros(B, O, N)
-        time_dow = H.new_zeros(B, O, N)
-
-        coef_state_tod = None
-        coef_state_dow = None
-
-        if self.coef_tod is not None and basis_tod.numel() > 0:
-            coef_state_tod = self.coef_tod(H_aug)  # [B,N,P_tod]
-            if self.use_step_film and (step_emb is not None) and (self.step_scale_tod is not None):
-                if step_emb.shape[0] != O or step_emb.shape[1] != self.S:
-                    raise ValueError(f"step_emb should be [O,{self.S}], got {tuple(step_emb.shape)}")
-                ss = self.step_scale_tod(step_emb).to(H.dtype)  # [O,P_tod]
-                bb = self.step_shift_tod(step_emb).to(H.dtype)  # [O,P_tod]
-                coef_full = coef_state_tod.unsqueeze(1) * (1.0 + ss.unsqueeze(0).unsqueeze(2)) + bb.unsqueeze(0).unsqueeze(2)  # [B,O,N,P]
-                time_tod = torch.einsum("bop,bonp->bon", basis_tod, coef_full)
-            else:
-                time_tod = torch.einsum("bop,bnp->bon", basis_tod, coef_state_tod)
-
-        if self.coef_dow is not None and basis_dow.numel() > 0:
-            coef_state_dow = self.coef_dow(H_aug)  # [B,N,P_dow]
-            if self.use_step_film and (step_emb is not None) and (self.step_scale_dow is not None):
-                if step_emb.shape[0] != O or step_emb.shape[1] != self.S:
-                    raise ValueError(f"step_emb should be [O,{self.S}], got {tuple(step_emb.shape)}")
-                ss = self.step_scale_dow(step_emb).to(H.dtype)  # [O,P_dow]
-                bb = self.step_shift_dow(step_emb).to(H.dtype)  # [O,P_dow]
-                coef_full = coef_state_dow.unsqueeze(1) * (1.0 + ss.unsqueeze(0).unsqueeze(2)) + bb.unsqueeze(0).unsqueeze(2)
-                time_dow = torch.einsum("bop,bonp->bon", basis_dow, coef_full)
-            else:
-                time_dow = torch.einsum("bop,bnp->bon", basis_dow, coef_state_dow)
-
-        time_total = time_tod + time_dow
-
-        info = {
-            "time_tod": time_tod,
-            "time_dow": time_dow,
-            "time_total": time_total,
-            "time_coef_tod_state": coef_state_tod,  # [B,N,P_tod] or None
-            "time_coef_dow_state": coef_state_dow,  # [B,N,P_dow] or None
-            "time_basis_tod": basis_tod,            # [B,O,P_tod]
-            "time_basis_dow": basis_dow,            # [B,O,P_dow]
-        }
-        return time_total, info
+        H_layers = torch.stack(outs, dim=0)  # [layers,B*N,D]
+        H_layers = H_layers.reshape(self.layers, B, N, self.D)
+        return H_layers
 
 
-# =========================================================
-# Module A) Spatial interpretability: low-rank PSD dynamic kernel on H (no N×N)
-# =========================================================
-
-class LowRankDynamicKernelOnFeatures(nn.Module):
-    r"""
-    Adjacency-free dynamic interaction on features H via a low-rank operator.
-
-    For each horizon o:
-        A(b,o) = B diag(s(b,o)) B^T,   s(b,o) >= 0  =>  A(b,o) PSD, rank<=r.
-
-    We DO NOT materialize A (N×N). Compute:
-        M = A H = B ( s ⊙ (B^T H) )     with O(N*r*D).
-
-    Output (module-internal convex update):
-        H_graph = H_base + alpha*(M - H_base), alpha in [0,1].
-
-    NOTE on normalization:
-      - If graph_normalize=True, the current implementation uses a degree-like normalization based on B.sum(dim=0),
-        which is meaningful/stable mainly when basis entries are nonnegative.
-      - For signed bases (graph_nonnegative_basis=False), we strongly recommend graph_normalize=False (as your exp-8 showed).
-    """
-
-    def __init__(
-        self,
-        num_features: int,
-        feat_dim: int,
-        rank: int,
-        num_timestamps: int,
-        use_output_timestamps: bool,
-        hidden_size: int,
-        dropout: float,
-        nonnegative_basis: bool,
-        normalize: bool,
-        alpha: float,
-        scale_activation: str = "softplus",
-        scale_bound: float = 1.0,
-        step_emb_dim: int = 0,
-        use_step_embedding: bool = False,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.N = int(num_features)
-        self.D = int(feat_dim)
-        self.r = int(rank)
-        self.T = int(num_timestamps)
-        self.use_out_ts = bool(use_output_timestamps)
-        self.use_step = bool(use_step_embedding) and int(step_emb_dim) > 0
-        self.S = int(step_emb_dim) if self.use_step else 0
-
-        self.nonneg = bool(nonnegative_basis)
-        self.normalize = bool(normalize)
-        self.eps = float(eps)
-        self.scale_act = str(scale_activation).lower()
-        self.scale_bound = float(scale_bound)
-
-        self.alpha = nn.Parameter(torch.tensor(float(alpha)))
-
-        self._basis = nn.Parameter(torch.empty(self.N, self.r))
-        nn.init.xavier_uniform_(self._basis)
-
-        in_dim = self.r + (self.T if self.use_out_ts else 0) + (self.S if self.use_step else 0)
-        self.scale_mlp = nn.Sequential(
-            nn.Linear(in_dim, int(hidden_size)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_size), self.r),
+def build_backbone(cfg: MyModelConfig, L: int, N: int, T: int, in_extra: int) -> nn.Module:
+    typ = cfg.backbone_type.lower()
+    if typ in ("gru", "lstm"):
+        return RNNBackbone(
+            rnn_type=typ,
+            L=L, N=N, T=T,
+            in_extra=in_extra,
+            D=int(cfg.backbone_hidden_size),
+            layers=int(cfg.backbone_layers),
+            dropout=float(cfg.backbone_dropout),
+            use_ts=bool(cfg.use_input_timestamps),
         )
-
-    def basis(self) -> torch.Tensor:
-        return torch.nn.functional.softplus(self._basis) if self.nonneg else self._basis
-
-    def forward(
-        self,
-        H: torch.Tensor,                               # [B,N,D]
-        ts_out: Optional[torch.Tensor],                # [B,O,T]
-        O: int,
-        step_emb: Optional[torch.Tensor] = None,       # [O,S]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if H.ndim != 3:
-            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
-        Bsz, N, D = H.shape
-        if N != self.N or D != self.D:
-            raise ValueError(f"H shape mismatch: got {tuple(H.shape)}, expected [B,{self.N},{self.D}]")
-
-        Bmat = self.basis()                                   # [N,r]
-        U = torch.einsum("bnd,nr->brd", H, Bmat)              # [B,r,D]
-        ctx = torch.sqrt(torch.mean(U ** 2, dim=-1) + self.eps)  # [B,r]
-
-        feat_parts = []
-        if self.use_out_ts:
-            if ts_out is None:
-                raise ValueError("graph_use_output_timestamps=True but targets_timestamps is None.")
-            if ts_out.shape[0] != Bsz or ts_out.shape[1] != O:
-                raise ValueError(f"targets_timestamps should be [B,O,T], got {tuple(ts_out.shape)}")
-            feat_parts.append(ts_out.float())  # [B,O,T]
-
-        feat_parts.append(ctx.unsqueeze(1).expand(-1, O, -1))  # [B,O,r]
-
-        if self.use_step:
-            if step_emb is None:
-                raise ValueError("use_step_embedding=True but step_emb is None.")
-            if step_emb.shape[0] != O or step_emb.shape[1] != self.S:
-                raise ValueError(f"step_emb should be [O,{self.S}], got {tuple(step_emb.shape)}")
-            se = step_emb.unsqueeze(0).expand(Bsz, -1, -1).to(ctx.dtype)  # [B,O,S]
-            feat_parts.append(se)
-
-        feat = torch.cat(feat_parts, dim=-1)  # [B,O, ...]
-        s_raw = self.scale_mlp(feat)          # [B,O,r]
-        if self.scale_act == "softplus":
-            s = torch.nn.functional.softplus(s_raw)  # >=0
-        elif self.scale_act == "tanh":
-            s = self.scale_bound * torch.tanh(s_raw)  # signed, bounded
-        else:
-            raise ValueError(f"Unknown graph_scale_activation: {self.scale_act} (expected softplus|tanh)")
-
-        # M = B ( s ⊙ (B^T H) )
-        Uexp = U.unsqueeze(1)                    # [B,1,r,D]
-        X = s.unsqueeze(-1) * Uexp               # [B,O,r,D]
-        M = torch.einsum("bord,nr->bond", X, Bmat)  # [B,O,N,D]
-
-        if self.normalize:
-            b_sum = Bmat.sum(dim=0)                        # [r]
-            deg = torch.einsum("bor,nr->bon", s * b_sum.view(1, 1, -1), Bmat)  # [B,O,N]
-            M = M / (deg.unsqueeze(-1) + self.eps)
-
-        H_base = H.unsqueeze(1).expand(-1, O, -1, -1)
-        alpha = torch.clamp(self.alpha, 0.0, 1.0)
-        H_graph = H_base + alpha * (M - H_base)
-
-        info = {
-            "graph_basis": Bmat,      # [N,r]
-            "graph_scales": s,        # [B,O,r]
-            "graph_mode_proj": U,     # [B,r,D]
-            "graph_alpha": alpha.detach(),
-        }
-        return H_graph, info
-
-
-
-
-class LowRankDirectedKernelOnFeatures(nn.Module):
-    r"""
-    Directed adjacency-free dynamic interaction on features H via a low-rank operator.
-
-    For each horizon o:
-        A(b,o) = P diag(s(b,o)) Q^T,    (rank<=r, generally asymmetric)
-
-    We DO NOT materialize A (N×N). Compute:
-        M = A H = P ( s ⊙ (Q^T H) )     with O(N*r*D).
-
-    Output (module-internal convex update):
-        H_graph = H_base + alpha*(M - H_base), alpha in [0,1].
-
-    Notes:
-      - For directed / signed interactions, we recommend graph_normalize=False.
-      - You can optionally bound s via tanh (cfg.graph_scale_activation="tanh") for stability.
-    """
-
-    def __init__(
-        self,
-        num_features: int,
-        feat_dim: int,
-        rank: int,
-        num_timestamps: int,
-        use_output_timestamps: bool,
-        hidden_size: int,
-        dropout: float,
-        nonnegative_basis: bool,
-        normalize: bool,
-        alpha: float,
-        scale_activation: str = "softplus",
-        scale_bound: float = 1.0,
-        step_emb_dim: int = 0,
-        use_step_embedding: bool = False,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.N = int(num_features)
-        self.D = int(feat_dim)
-        self.r = int(rank)
-        self.T = int(num_timestamps)
-        self.use_out_ts = bool(use_output_timestamps)
-        self.use_step = bool(use_step_embedding) and int(step_emb_dim) > 0
-        self.S = int(step_emb_dim) if self.use_step else 0
-
-        self.nonneg = bool(nonnegative_basis)
-        self.normalize = bool(normalize)
-        self.eps = float(eps)
-
-        self.scale_act = str(scale_activation).lower()
-        self.scale_bound = float(scale_bound)
-
-        if self.normalize:
-            # directed degree normalization is ambiguous; enforce off to avoid silent instability
-            raise ValueError("graph_normalize=True is not supported for directed operator. Set graph_normalize=False.")
-
-        self.alpha = nn.Parameter(torch.tensor(float(alpha)))
-
-        self._P = nn.Parameter(torch.empty(self.N, self.r))
-        self._Q = nn.Parameter(torch.empty(self.N, self.r))
-        nn.init.xavier_uniform_(self._P)
-        nn.init.xavier_uniform_(self._Q)
-
-        in_dim = self.r + (self.T if self.use_out_ts else 0) + (self.S if self.use_step else 0)
-        self.scale_mlp = nn.Sequential(
-            nn.Linear(in_dim, int(hidden_size)),
-            nn.GELU(),
-            nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden_size), self.r),
+    elif typ == "transformer":
+        return TransformerBackbone(
+            L=L, N=N, T=T,
+            in_extra=in_extra,
+            D=int(cfg.backbone_hidden_size),
+            layers=int(cfg.backbone_layers),
+            nhead=int(cfg.transformer_nhead),
+            ffn_ratio=float(cfg.transformer_ffn_ratio),
+            dropout=float(cfg.backbone_dropout),
+            norm_first=bool(cfg.transformer_norm_first),
+            use_pe=bool(cfg.transformer_use_positional_encoding),
+            use_ts=bool(cfg.use_input_timestamps),
         )
-
-    def left_basis(self) -> torch.Tensor:
-        P = torch.nn.functional.softplus(self._P) if self.nonneg else self._P
-        return P
-
-    def right_basis(self) -> torch.Tensor:
-        Q = torch.nn.functional.softplus(self._Q) if self.nonneg else self._Q
-        return Q
-
-    def forward(
-        self,
-        H: torch.Tensor,                               # [B,N,D]
-        ts_out: Optional[torch.Tensor],                # [B,O,T]
-        O: int,
-        step_emb: Optional[torch.Tensor] = None,       # [O,S]
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        if H.ndim != 3:
-            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
-        Bsz, N, D = H.shape
-        if N != self.N or D != self.D:
-            raise ValueError(f"H shape mismatch: got {tuple(H.shape)}, expected [B,{self.N},{self.D}]")
-
-        P = self.left_basis()                          # [N,r]
-        Q = self.right_basis()                         # [N,r]
-
-        U = torch.einsum("bnd,nr->brd", H, Q)           # [B,r,D]
-        ctx = torch.sqrt(torch.mean(U ** 2, dim=-1) + self.eps)  # [B,r]
-
-        feat_parts = []
-        if self.use_out_ts:
-            if ts_out is None:
-                raise ValueError("graph_use_output_timestamps=True but targets_timestamps is None.")
-            if ts_out.shape[0] != Bsz or ts_out.shape[1] != O:
-                raise ValueError(f"targets_timestamps should be [B,O,T], got {tuple(ts_out.shape)}")
-            feat_parts.append(ts_out.float())  # [B,O,T]
-
-        feat_parts.append(ctx.unsqueeze(1).expand(-1, O, -1))  # [B,O,r]
-
-        if self.use_step:
-            if step_emb is None:
-                raise ValueError("use_step_embedding=True but step_emb is None.")
-            if step_emb.shape[0] != O or step_emb.shape[1] != self.S:
-                raise ValueError(f"step_emb should be [O,{self.S}], got {tuple(step_emb.shape)}")
-            se = step_emb.unsqueeze(0).expand(Bsz, -1, -1).to(ctx.dtype)  # [B,O,S]
-            feat_parts.append(se)
-
-        feat = torch.cat(feat_parts, dim=-1)  # [B,O,...]
-        s_raw = self.scale_mlp(feat)          # [B,O,r]
-
-        if self.scale_act == "softplus":
-            s = torch.nn.functional.softplus(s_raw)  # >=0
-        elif self.scale_act == "tanh":
-            s = self.scale_bound * torch.tanh(s_raw)  # signed, bounded
-        else:
-            raise ValueError(f"Unknown graph_scale_activation: {self.scale_act} (expected softplus|tanh)")
-
-        # M = P ( s ⊙ (Q^T H) )
-        Uexp = U.unsqueeze(1)                           # [B,1,r,D]
-        X = s.unsqueeze(-1) * Uexp                      # [B,O,r,D]
-        M = torch.einsum("bord,nr->bond", X, P)         # [B,O,N,D]
-
-        H_base = H.unsqueeze(1).expand(-1, O, -1, -1)
-        alpha = torch.clamp(self.alpha, 0.0, 1.0)
-        H_graph = H_base + alpha * (M - H_base)
-
-        info = {
-            "graph_left_basis": P,
-            "graph_right_basis": Q,
-            "graph_scales": s,
-            "graph_mode_proj": U,
-            "graph_alpha": alpha.detach(),
-        }
-        return H_graph, info
+    else:
+        raise ValueError(f"Unknown backbone_type: {cfg.backbone_type}")
 
 
-# =========================================================
-# Fusion: convex weights (base + graph), with configurable granularity
-# =========================================================
+# ============================================================
+# Branch: Spatial (low-rank, avoids N×N)
+# ============================================================
 
-class ConvexGraphFusion(nn.Module):
-    """
-    Convex weights for combining base and graph features.
-
-    Output:
-      dict {"w_base": ..., "w_graph": ...}
-
-    Shapes by fusion_mode:
-      - global:           []          (scalar)
-      - per_horizon:      [O]
-      - per_node:         [N]
-      - per_node_horizon: [O, N]      (factorized: raw0 + raw_step[o] + raw_node[n])
-    """
-
-    def __init__(
-        self,
-        learnable: bool,
-        raw_init: float,
-        mode: str,
-        num_nodes: int,
-        num_horizons: int,
-        w_min: float = 0.0,
-        w_max: float = 1.0,
-    ):
+class SpatialLowRank(nn.Module):
+    def __init__(self, N: int, D: int, r: int, T: int, S: int, hidden: int, dropout: float, alpha: float, reg_orth: float):
         super().__init__()
-        self.learnable = bool(learnable)
-        self.mode = str(mode).lower()
-        self.N = int(num_nodes)
-        self.O = int(num_horizons)
-        self.w_min = float(w_min)
-        self.w_max = float(w_max)
-        if not (0.0 <= self.w_min <= self.w_max <= 1.0):
-            raise ValueError(f"fusion_w_min/max must satisfy 0<=min<=max<=1, got {self.w_min},{self.w_max}")
+        self.N, self.D, self.r = int(N), int(D), int(r)
+        self.T, self.S = int(T), int(S)
+        self.alpha = float(alpha)
+        self.reg_orth = float(reg_orth)
 
-        def make_param(shape, init):
-            t = torch.full(shape, float(init))
-            return nn.Parameter(t) if self.learnable else t
+        self.B = nn.Parameter(torch.empty(self.N, self.r))
+        nn.init.xavier_uniform_(self.B)
 
-        # global logit
-        self.raw0 = make_param((), raw_init)
-
-        if self.mode == "global":
-            self.raw_step = None
-            self.raw_node = None
-        elif self.mode == "per_horizon":
-            self.raw_step = make_param((self.O,), raw_init)
-            self.raw_node = None
-        elif self.mode == "per_node":
-            self.raw_step = None
-            self.raw_node = make_param((self.N,), raw_init)
-        elif self.mode == "per_node_horizon":
-            # factorized (cheap): init step/node to 0 so initial wg ~= sigmoid(raw0)
-            self.raw_step = make_param((self.O,), 0.0)
-            self.raw_node = make_param((self.N,), 0.0)
-        else:
-            raise ValueError(f"Unknown fusion_mode: {mode} (expected global|per_horizon|per_node|per_node_horizon)")
-
-    @staticmethod
-    def _softplus_ratio(raw: torch.Tensor) -> torch.Tensor:
-        """Map raw logits to (0,1): w = softplus(raw) / (1 + softplus(raw))."""
-        u = torch.nn.functional.softplus(raw)
-        return u / (1.0 + u)
-
-    def forward(self) -> Dict[str, torch.Tensor]:
-        raw0 = self.raw0 if torch.is_tensor(self.raw0) else torch.as_tensor(self.raw0)
-        if self.mode == "global":
-            raw = raw0
-        elif self.mode == "per_horizon":
-            raw = self.raw_step if torch.is_tensor(self.raw_step) else torch.as_tensor(self.raw_step)
-        elif self.mode == "per_node":
-            raw = self.raw_node if torch.is_tensor(self.raw_node) else torch.as_tensor(self.raw_node)
-        else:  # per_node_horizon
-            rs = self.raw_step if torch.is_tensor(self.raw_step) else torch.as_tensor(self.raw_step)  # [O]
-            rn = self.raw_node if torch.is_tensor(self.raw_node) else torch.as_tensor(self.raw_node)  # [N]
-            raw = raw0 + rs.unsqueeze(-1) + rn.unsqueeze(0)  # [O,N]
-
-        w_graph = self._softplus_ratio(raw)
-        if not (self.w_min == 0.0 and self.w_max == 1.0):
-            w_graph = self.w_min + (self.w_max - self.w_min) * w_graph
-
-        w_base = 1.0 - w_graph
-        return {"w_base": w_base, "w_graph": w_graph}
-
-
-
-class DynamicPerHorizonFusion(nn.Module):
-    """
-    Dynamic convex fusion weights wg(b,o) in (0,1), conditioned on:
-      - a global context extracted from H (backbone feature)
-      - targets_timestamps ts_out (normalized to [0,1])
-      - optional step embedding
-
-    This addresses the limitation of a single static wg shared across all samples.
-    Output shapes:
-      w_graph: [B,O], w_base: [B,O]
-    """
-
-    def __init__(
-        self,
-        feat_dim: int,
-        num_timestamps: int,
-        num_horizons: int,
-        step_emb_dim: int,
-        use_step_embedding: bool,
-        ctx_dim: int,
-        hidden: int,
-        dropout: float,
-        raw_init: float,
-        w_min: float = 0.0,
-        w_max: float = 1.0,
-    ):
-        super().__init__()
-        self.D = int(feat_dim)
-        self.T = int(num_timestamps)
-        self.O = int(num_horizons)
-        self.S = int(step_emb_dim) if (use_step_embedding and int(step_emb_dim) > 0) else 0
-        self.use_step = self.S > 0
-
-        self.w_min = float(w_min)
-        self.w_max = float(w_max)
-        if not (0.0 <= self.w_min <= self.w_max <= 1.0):
-            raise ValueError(f"fusion_w_min/max must satisfy 0<=min<=max<=1, got {self.w_min},{self.w_max}")
-
-        self.ctx_proj = nn.Linear(self.D, int(ctx_dim), bias=True)
-
-        in_dim = int(ctx_dim) + self.T + (self.S if self.use_step else 0)
-        self.mlp = nn.Sequential(
+        in_dim = self.r + self.T + self.S
+        self.scale_mlp = nn.Sequential(
             nn.Linear(in_dim, int(hidden)),
             nn.GELU(),
             nn.Dropout(float(dropout)),
-            nn.Linear(int(hidden), 1),
+            nn.Linear(int(hidden), self.r),
         )
-        # initialize last bias so initial wg roughly matches raw_init mapping
-        with torch.no_grad():
-            self.mlp[-1].bias.fill_(float(raw_init))
 
-    @staticmethod
-    def _softplus_ratio(raw: torch.Tensor) -> torch.Tensor:
-        u = torch.nn.functional.softplus(raw)
-        return u / (1.0 + u)
+    def forward(self, H: torch.Tensor, ts_out: Optional[torch.Tensor], step_emb: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        H: [B,N,D]
+        ts_out: [B,O,T] or None
+        step_emb: [B,O,S] or None
+        return: H_spatial [B,O,N,D], info
+        """
+        Bsz, N, D = H.shape
+        Bmat = self.B
+        U = torch.einsum("bnd,nr->brd", H, Bmat)  # [B,r,D]
+        ctx = torch.sqrt(torch.mean(U ** 2, dim=-1) + 1e-6)  # [B,r]
 
-    def forward(
-        self,
-        H: torch.Tensor,                        # [B,N,D]
-        ts_out: torch.Tensor,                   # [B,O,T]
-        step_emb: Optional[torch.Tensor] = None # [O,S]
-    ) -> Dict[str, torch.Tensor]:
-        if H.ndim != 3:
-            raise ValueError(f"Expected H [B,N,D], got {tuple(H.shape)}")
-        B, N, D = H.shape
-        if ts_out.ndim != 3 or ts_out.shape[0] != B or ts_out.shape[1] != self.O or ts_out.shape[2] != self.T:
-            raise ValueError(f"targets_timestamps must be [B,O,T]=[{B},{self.O},{self.T}], got {tuple(ts_out.shape)}")
+        # build features for s(b,o)
+        O = 1
+        parts = [ctx.unsqueeze(1)]
+        if ts_out is not None:
+            O = ts_out.size(1)
+            parts.append(ts_out.float())
+        if step_emb is not None:
+            O = step_emb.size(1)
+            parts.append(step_emb.float())
+        feat = torch.cat([p.expand(-1, O, -1) if p.dim() == 3 and p.size(1) == 1 else p for p in parts], dim=-1)
 
-        # global context from H (mean over nodes)
-        ctx = self.ctx_proj(H).mean(dim=1)              # [B,ctx_dim]
-        ctx = ctx.unsqueeze(1).expand(-1, self.O, -1)   # [B,O,ctx_dim]
+        s = torch.nn.functional.softplus(self.scale_mlp(feat)) + 1e-6  # [B,O,r], >=0
 
-        parts = [ctx, ts_out.float()]
-        if self.use_step:
-            if step_emb is None:
-                raise ValueError("use_step_embedding=True but step_emb is None.")
-            if step_emb.shape[0] != self.O or step_emb.shape[1] != self.S:
-                raise ValueError(f"step_emb must be [O,S]=[{self.O},{self.S}], got {tuple(step_emb.shape)}")
-            se = step_emb.unsqueeze(0).expand(B, -1, -1).to(ctx.dtype)  # [B,O,S]
-            parts.append(se)
+        SU = s.unsqueeze(-1) * U.unsqueeze(1)               # [B,O,r,D]
+        M = torch.einsum("bord,nr->bond", SU, Bmat)         # [B,O,N,D]
 
-        feat = torch.cat(parts, dim=-1)  # [B,O,in_dim]
-        raw = self.mlp(feat).squeeze(-1) # [B,O]
+        H_base = H.unsqueeze(1).expand(-1, O, -1, -1)
+        H_spatial = H_base + self.alpha * (M - H_base)
 
-        wg = self._softplus_ratio(raw)
-        if not (self.w_min == 0.0 and self.w_max == 1.0):
-            wg = self.w_min + (self.w_max - self.w_min) * wg
-        wb = 1.0 - wg
-        return {"w_base": wb, "w_graph": wg}
+        info = {"graph_basis": Bmat, "graph_scales": s}
+        return H_spatial, info
+
+    def orth_reg(self) -> torch.Tensor:
+        if self.reg_orth <= 0:
+            return self.B.new_zeros(())
+        BtB = (self.B.t() @ self.B) / float(self.N)  # [r,r]
+        I = torch.eye(self.r, device=self.B.device, dtype=self.B.dtype)
+        return self.reg_orth * torch.mean((BtB - I) ** 2)
 
 
-def _expand_weight(w: torch.Tensor, B: int, O: int, N: int, D: int) -> torch.Tensor:
+# ============================================================
+# Branch: Time (NEW) Spectral-Token Attention
+# ============================================================
+
+class SpectralTokenTimeAttention(nn.Module):
     """
-    Expand a weight tensor to [B,O,N,1] (broadcastable to [B,O,N,D]).
+    Novel time attention for traffic:
+      - Build M periodic tokens = K_tod daily harmonics + K_dow weekly harmonics.
+      - Each token m has sin/cos value at the forecast timestamp (phase).
+      - Query comes from node state (and step embedding).
+      - Attention weights over tokens are interpretable: which periodicities matter now.
 
-    Accepted shapes:
-      scalar: []
-      per_horizon (static): [O]
-      per_node (static): [N]
-      per_node_horizon (static): [O,N]
-      dynamic_per_horizon: [B,O]
-      dynamic_per_node_horizon: [B,O,N]
+    Output is a feature residual delta_time [B,O,N,D] added to H_base.
     """
-    if w.ndim == 0:
-        return w.view(1, 1, 1, 1).expand(B, O, N, 1)
-    if w.ndim == 1 and w.shape[0] == O:
-        return w.view(1, O, 1, 1).expand(B, O, N, 1)
-    if w.ndim == 1 and w.shape[0] == N:
-        return w.view(1, 1, N, 1).expand(B, O, N, 1)
-    if w.ndim == 2 and w.shape == (O, N):
-        return w.view(1, O, N, 1).expand(B, O, N, 1)
-    if w.ndim == 2 and w.shape == (B, O):
-        return w.view(B, O, 1, 1).expand(B, O, N, 1)
-    if w.ndim == 3 and w.shape == (B, O, N):
-        return w.view(B, O, N, 1)
-    raise ValueError(f"Unsupported fusion weight shape: {tuple(w.shape)}")
+    def __init__(self, D: int, S: int, K_tod: int, K_dow: int, attn_dim: int, alpha: float, gate_bound: float):
+        super().__init__()
+        self.D, self.S = int(D), int(S)
+        self.K_tod, self.K_dow = int(K_tod), int(K_dow)
+        self.M = self.K_tod + self.K_dow
+        self.attn_dim = int(attn_dim)
+        self.alpha = float(alpha)
+        self.gate_bound = float(gate_bound)
+
+        # token ids: 0..M-1, includes both tod and dow harmonics
+        self.key_emb = nn.Embedding(self.M, self.attn_dim)
+        self.val_emb = nn.Embedding(self.M, self.D)
+
+        self.k_proj = nn.Linear(2, self.attn_dim, bias=False)
+        self.g_proj = nn.Linear(2, 1, bias=True)
+
+        q_in = self.D + self.S
+        self.q_proj = nn.Linear(q_in, self.attn_dim, bias=True)
+
+    def forward(self, H: torch.Tensor, ts_out: torch.Tensor, step_emb: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """
+        H: [B,N,D]
+        ts_out: [B,O,T>=2] uses first two dims: [tod, dow]
+        step_emb: [B,O,S] (or None if S=0)
+        """
+        Bsz, N, D = H.shape
+        O = ts_out.size(1)
+        tod = ts_out[..., 0]
+        dow = ts_out[..., 1]
+
+        # build tokens: [B,O,M,2]
+        toks = []
+        for k in range(1, self.K_tod + 1):
+            toks.append(_fourier_sincos(tod, k))
+        for k in range(1, self.K_dow + 1):
+            toks.append(_fourier_sincos(dow, k))
+        tok = torch.stack(toks, dim=2) if toks else tod.new_zeros((Bsz, O, 0, 2))  # [B,O,M,2]
+
+        token_ids = torch.arange(self.M, device=H.device, dtype=torch.long)  # [M]
+        key = self.k_proj(tok) + self.key_emb(token_ids).view(1, 1, self.M, self.attn_dim)  # [B,O,M,A]
+        gate = torch.tanh(self.g_proj(tok)) * self.gate_bound                                  # [B,O,M,1]
+        val = gate * self.val_emb(token_ids).view(1, 1, self.M, self.D)                        # [B,O,M,D]
+
+        H_rep = H.unsqueeze(1).expand(-1, O, -1, -1)  # [B,O,N,D]
+        if self.S > 0 and step_emb is not None:
+            step_rep = step_emb.unsqueeze(2).expand(-1, -1, N, -1)  # [B,O,N,S]
+            q_in = torch.cat([H_rep, step_rep], dim=-1)
+        else:
+            q_in = torch.cat([H_rep, H_rep.new_zeros((Bsz, O, N, 0))], dim=-1)
+
+        q = self.q_proj(q_in)  # [B,O,N,A]
+
+        # attn logits: [B,O,N,M]
+        logits = torch.einsum("bona,boma->bonm", q, key) / math.sqrt(float(self.attn_dim))
+        attn = torch.softmax(logits, dim=-1)
+
+        delta = torch.einsum("bonm,bomd->bond", attn, val)  # [B,O,N,D]
+        H_time = H_rep + self.alpha * delta
+
+        info = {"time_attn": attn, "time_gate": gate.squeeze(-1)}
+        return H_time, info
 
 
-def _augment_decoder_features(
-    F: torch.Tensor,                      # [B,O,N,D]
-    node_emb: Optional[torch.Tensor],     # [N,E]
-    step_emb: Optional[torch.Tensor],     # [O,S]
-    ts_out: Optional[torch.Tensor],       # [B,O,T]
-    use_node: bool,
-    use_step: bool,
-    use_ts: bool,
-) -> torch.Tensor:
-    B, O, N, D = F.shape
-    parts = [F]
-    if use_node and (node_emb is not None):
-        ne = node_emb.view(1, 1, N, -1).expand(B, O, N, -1).to(F.dtype)
-        parts.append(ne)
-    if use_step and (step_emb is not None):
-        se = step_emb.view(1, O, 1, -1).expand(B, O, N, -1).to(F.dtype)
-        parts.append(se)
-    if use_ts:
-        if ts_out is None:
-            raise ValueError("decoder_use_output_timestamps=True but targets_timestamps is None.")
-        if ts_out.shape[0] != B or ts_out.shape[1] != O:
-            raise ValueError(f"targets_timestamps should be [B,O,T], got {tuple(ts_out.shape)}")
-        te = ts_out.float().unsqueeze(2).expand(B, O, N, -1).to(F.dtype)  # [B,O,N,T]
-        parts.append(te)
-    if len(parts) == 1:
-        return F
-    return torch.cat(parts, dim=-1)
+# ============================================================
+# Convex fusion: base + spatial + time
+# ============================================================
+
+class ConvexFusion3(nn.Module):
+    """
+    weights:
+      us = softplus(raw_s), ut = softplus(raw_t)
+      ws = us/(1+us+ut), wt = ut/(1+us+ut), w0 = 1/(1+us+ut)
+    """
+    def __init__(self, raw_s_init: float, raw_t_init: float, learnable: bool = True):
+        super().__init__()
+        rs = torch.tensor(float(raw_s_init))
+        rt = torch.tensor(float(raw_t_init))
+        if learnable:
+            self.raw_s = nn.Parameter(rs)
+            self.raw_t = nn.Parameter(rt)
+        else:
+            self.register_buffer("raw_s", rs, persistent=True)
+            self.register_buffer("raw_t", rt, persistent=True)
+
+    def forward(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        us = torch.nn.functional.softplus(self.raw_s)
+        ut = torch.nn.functional.softplus(self.raw_t)
+        denom = 1.0 + us + ut
+        w0 = 1.0 / denom
+        ws = us / denom
+        wt = ut / denom
+        return w0, ws, wt
 
 
-# =========================================================
-# MyModel
-# =========================================================
+# ============================================================
+# Decoder blocks
+# ============================================================
+
+class DecoderMLP(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, dropout: float):
+        super().__init__()
+        if hidden <= 0:
+            self.net = nn.Linear(in_dim, 1)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, int(hidden)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden), 1),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x).squeeze(-1)
+
+
+class ParamHead(nn.Module):
+    """Generic parameter head: outputs K scalars."""
+    def __init__(self, in_dim: int, hidden: int, out_dim: int, dropout: float):
+        super().__init__()
+        if hidden <= 0:
+            self.net = nn.Linear(in_dim, out_dim)
+        else:
+            self.net = nn.Sequential(
+                nn.Linear(in_dim, int(hidden)),
+                nn.GELU(),
+                nn.Dropout(float(dropout)),
+                nn.Linear(int(hidden), out_dim),
+            )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+# ============================================================
+# Main model
+# ============================================================
 
 class MyModel(nn.Module):
-    """
-    MyModel (v5): Backbone-H + interpretable Spatial/Time modules + convex fusion + internal loss.
-
-    Key upgrades over the earlier version (to break the 21.x plateau you observed):
-      1) Node embedding (captures node heterogeneity; critical on PEMS07 with N=883).
-      2) Step/horizon embedding (captures lead-time heterogeneity; critical for multi-step O=12).
-      3) Fusion granularity options (global / per_horizon / per_node / factorized per_node_horizon).
-         This addresses the "global wg is a compromise" issue you identified by Step A plateau.
-
-    Runner compatibility:
-      - forward_return includes "loss" when targets are provided and compute_loss_in_forward=True.
-    """
-
     def __init__(self, cfg: MyModelConfig):
         super().__init__()
         self.cfg = cfg
 
+        # fixed shapes
         self.L = int(cfg.input_len)
         self.O = int(cfg.output_len)
         self.N = int(cfg.num_features)
         self.T = int(cfg.num_timestamps)
+        self.D = int(cfg.backbone_hidden_size)
 
         self.last_value_centering = bool(cfg.last_value_centering)
-        self.dropout = nn.Dropout(float(cfg.dropout))
 
-        # ---- identity embeddings ----
-        self.node_emb_dim = int(getattr(cfg, "node_emb_dim", 0))
-        self.step_emb_dim = int(getattr(cfg, "step_emb_dim", 0))
-        self.node_emb_in_backbone = bool(getattr(cfg, "node_emb_in_backbone", True))
-        self.node_emb_in_decoder = bool(getattr(cfg, "node_emb_in_decoder", True))
-        self.step_emb_in_decoder = bool(getattr(cfg, "step_emb_in_decoder", True))
-        self.step_emb_in_time = bool(getattr(cfg, "step_emb_in_time", True))
-        self.step_emb_in_graph = bool(getattr(cfg, "step_emb_in_graph", True))
+        # embeddings
+        self.node_emb_dim = int(cfg.node_emb_dim)
+        self.step_emb_dim = int(cfg.step_emb_dim)
+        self.drop = nn.Dropout(float(cfg.dropout))
 
-        self.node_emb = None
-        self.node_emb_drop = nn.Dropout(float(getattr(cfg, "node_emb_dropout", 0.0)))
-        if self.node_emb_dim > 0:
-            self.node_emb = nn.Embedding(self.N, self.node_emb_dim)
-            nn.init.normal_(self.node_emb.weight, mean=0.0, std=0.02)
+        self.node_emb = nn.Embedding(self.N, self.node_emb_dim) if self.node_emb_dim > 0 else None
+        self.step_emb = nn.Embedding(self.O, self.step_emb_dim) if self.step_emb_dim > 0 else None
 
-        self.step_emb = None
-        if self.step_emb_dim > 0:
-            self.step_emb = nn.Embedding(self.O, self.step_emb_dim)
-            nn.init.normal_(self.step_emb.weight, mean=0.0, std=0.02)
+        # backbone input extra dims = node_emb_dim (we always inject node id into backbone when enabled)
+        self.backbone = build_backbone(cfg, L=self.L, N=self.N, T=self.T, in_extra=self.node_emb_dim)
 
-        self.node_bias = None
-        if bool(getattr(cfg, "node_bias", False)):
-            self.node_bias = nn.Parameter(torch.zeros(self.N))
-
-        # ---- trunk ----
-        self.backbone = NodeTemporalBackbone(cfg)
-        D = int(self.backbone.out_dim)
-
-        # ---- spatial module ----
-        self.graph = None
-        if bool(cfg.enable_dynamic_graph):
-            gvar = str(getattr(cfg, "graph_variant", "symmetric")).lower()
-            scale_act = str(getattr(cfg, "graph_scale_activation", "softplus")).lower()
-            scale_bound = float(getattr(cfg, "graph_scale_bound", 1.0))
-
-            common_kwargs = dict(
-                num_features=self.N,
-                feat_dim=D,
-                rank=int(cfg.graph_rank),
-                num_timestamps=self.T,
-                use_output_timestamps=bool(cfg.graph_use_output_timestamps) and bool(cfg.use_output_timestamps),
-                hidden_size=int(cfg.graph_scale_hidden_size),
-                dropout=float(cfg.graph_scale_dropout),
-                nonnegative_basis=bool(cfg.graph_nonnegative_basis),
-                normalize=bool(cfg.graph_normalize),
-                alpha=float(cfg.graph_alpha),
-                scale_activation=scale_act,
-                scale_bound=scale_bound,
-                step_emb_dim=self.step_emb_dim,
-                use_step_embedding=self.step_emb_in_graph and self.step_emb_dim > 0,
+        # branches
+        self.enable_spatial = bool(cfg.enable_spatial)
+        self.spatial = None
+        if self.enable_spatial:
+            self.spatial = SpatialLowRank(
+                N=self.N, D=self.D, r=int(cfg.spatial_rank),
+                T=self.T if bool(cfg.spatial_use_output_timestamps) else 0,
+                S=self.step_emb_dim,
+                hidden=int(cfg.spatial_scale_hidden),
+                dropout=float(cfg.spatial_scale_dropout),
+                alpha=float(cfg.spatial_alpha),
+                reg_orth=float(cfg.reg_spatial_orth),
             )
 
-            if gvar == "directed":
-                self.graph = LowRankDirectedKernelOnFeatures(**common_kwargs)
-            elif gvar == "symmetric":
-                self.graph = LowRankDynamicKernelOnFeatures(**common_kwargs)
-            else:
-                raise ValueError(f"Unknown graph_variant: {gvar} (expected symmetric|directed)")
-
-        # ---- fusion ----
-        self.fusion_mode = str(getattr(cfg, "fusion_mode", "global")).lower()
-
-        if self.fusion_mode == "dynamic_per_horizon":
-            if not bool(cfg.use_output_timestamps):
-                raise ValueError("fusion_mode=dynamic_per_horizon requires use_output_timestamps=True (need targets_timestamps).")
-            self.fusion = DynamicPerHorizonFusion(
-                feat_dim=D,
-                num_timestamps=self.T,
-                num_horizons=self.O,
-                step_emb_dim=self.step_emb_dim,
-                use_step_embedding=self.step_emb_dim > 0,
-                ctx_dim=int(getattr(cfg, "fusion_dynamic_ctx_dim", 16)),
-                hidden=int(getattr(cfg, "fusion_dynamic_hidden", 64)),
-                dropout=float(getattr(cfg, "fusion_dynamic_dropout", 0.0)),
-                raw_init=float(cfg.fusion_raw_init),
-                w_min=float(getattr(cfg, "fusion_w_min", 0.0)),
-                w_max=float(getattr(cfg, "fusion_w_max", 1.0)),
-            )
-        else:
-            self.fusion = ConvexGraphFusion(
-                learnable=bool(cfg.fusion_learnable),
-                raw_init=float(cfg.fusion_raw_init),
-                mode=self.fusion_mode,
-                num_nodes=self.N,
-                num_horizons=self.O,
-                w_min=float(getattr(cfg, "fusion_w_min", 0.0)),
-                w_max=float(getattr(cfg, "fusion_w_max", 1.0)),
-            )
-
-        # ---- time module ----
-        self.time_effect = None
-        if bool(cfg.enable_time_effect) and bool(cfg.use_output_timestamps):
-            self.time_effect = FourierTimeEffect(
-                feat_dim=D,
-                node_emb_dim=self.node_emb_dim if self.node_emb_dim > 0 else 0,
-                step_emb_dim=self.step_emb_dim if (self.step_emb_in_time and self.step_emb_dim > 0) else 0,
+        self.enable_time = bool(cfg.enable_time)
+        self.time = None
+        if self.enable_time:
+            self.time = SpectralTokenTimeAttention(
+                D=self.D,
+                S=self.step_emb_dim,
                 K_tod=int(cfg.time_tod_harmonics),
                 K_dow=int(cfg.time_dow_harmonics),
-                coef_hidden=int(cfg.time_coef_hidden),
-                dropout=float(cfg.time_coef_dropout),
-                use_step_film=self.step_emb_in_time and self.step_emb_dim > 0,
+                attn_dim=int(cfg.time_attn_dim),
+                alpha=float(cfg.time_alpha),
+                gate_bound=float(cfg.time_gate_bound),
             )
 
-        # ---- decoder heads ----
-        self.decoder_use_ts = bool(getattr(cfg, "decoder_use_output_timestamps", False))
-        if self.decoder_use_ts and (not bool(cfg.use_output_timestamps)):
-            raise ValueError("decoder_use_output_timestamps=True requires use_output_timestamps=True.")
+        # fusion
+        self.fusion = ConvexFusion3(
+            raw_s_init=float(cfg.fusion_raw_spatial_init),
+            raw_t_init=float(cfg.fusion_raw_time_init),
+            learnable=bool(cfg.fusion_learnable),
+        )
 
-        dec_dim = D
-        if self.node_emb_dim > 0 and self.node_emb_in_decoder:
-            dec_dim += self.node_emb_dim
-        if self.step_emb_dim > 0 and self.step_emb_in_decoder:
-            dec_dim += self.step_emb_dim
-        if self.decoder_use_ts:
-            dec_dim += self.T
+        # decoder input dim
+        dec_in = self.D
+        if self.step_emb_dim > 0:
+            dec_in += self.step_emb_dim
+        if self.node_emb_dim > 0:
+            dec_in += self.node_emb_dim
+        self.decoder_use_ts_out = bool(cfg.decoder_use_output_timestamps)
+        if self.decoder_use_ts_out:
+            dec_in += self.T
 
-        self.mu_head = nn.Linear(dec_dim, 1, bias=True)
+        self.mu_head = DecoderMLP(in_dim=dec_in, hidden=int(cfg.decoder_mlp_hidden), dropout=float(cfg.dropout))
 
-        # probabilistic head
-        self.likelihood = str(cfg.likelihood).lower()
+        # distribution parameter heads (share same dec_in)
+        self.likelihood = cfg.likelihood.lower()
         self.min_scale = float(cfg.min_scale)
+
         self.scale_head = None
-        self.studentt_df_param = None
+        self.quantile_head = None
+        if self.likelihood in ("gaussian", "studentt"):
+            self.scale_head = ParamHead(dec_in, hidden=int(cfg.decoder_mlp_hidden), out_dim=1, dropout=float(cfg.dropout))
+        elif self.likelihood == "quantile":
+            self.quantile_levels = list(cfg.quantiles)
+            self.quantile_head = ParamHead(dec_in, hidden=int(cfg.decoder_mlp_hidden), out_dim=len(self.quantile_levels), dropout=float(cfg.dropout))
+
+        # student-t df
+        self.studentt_df_mode = cfg.studentt_df_mode
         self.studentt_df_min = float(cfg.studentt_df_min)
-
-        if self.likelihood in {"gaussian", "studentt", "laplace", "lognormal", "gamma", "negbinom"}:
-            self.scale_head = nn.Linear(dec_dim, 1, bias=True)
-
-            if self.likelihood == "studentt":
-                mode = str(cfg.studentt_df_mode).lower()
-                if mode == "fixed":
-                    self.register_buffer("_studentt_df_fixed", torch.tensor(float(cfg.studentt_df_init)))
-                elif mode == "learned_global":
-                    init = float(cfg.studentt_df_init)
-                    x0 = math.log(math.expm1(max(init - self.studentt_df_min, 1e-3)))
-                    self.studentt_df_param = nn.Parameter(torch.tensor(x0))
-                else:
-                    raise ValueError(f"studentt_df_mode must be fixed|learned_global, got {mode}")
-
-        # quantile head
-        self.quantiles = None
-        self.q_levels = None
-        self.quantile_monotone = bool(cfg.quantile_monotone)
-        self.quantile_pred_level = float(cfg.quantile_pred_level)
-        self.quantile_crossing_penalty = float(cfg.quantile_crossing_penalty)
-
-        self.q0_head = None
-        self.qdelta_head = None
-        self.qall_head = None
-
-        if self.likelihood == "quantile":
-            q = sorted(set(float(x) for x in cfg.quantiles))
-            if len(q) < 2:
-                raise ValueError("quantiles must have at least 2 values.")
-            for x in q:
-                if not (0.0 < x < 1.0):
-                    raise ValueError(f"Invalid quantile {x}, should be in (0,1).")
-            self.quantiles = q
-            self.register_buffer("q_levels", torch.tensor(q), persistent=False)
-            Q = len(q)
-
-            if self.quantile_monotone:
-                self.q0_head = nn.Linear(dec_dim, 1, bias=True)
-                self.qdelta_head = nn.Linear(dec_dim, Q - 1, bias=True)
+        if self.likelihood == "studentt":
+            if self.studentt_df_mode == "learned_global":
+                df_init = float(cfg.studentt_df_init)
+                self.df_raw = nn.Parameter(torch.tensor(df_init))
             else:
-                self.qall_head = nn.Linear(dec_dim, Q, bias=True)
+                self.register_buffer("df_raw", torch.tensor(float(cfg.studentt_df_init)), persistent=False)
 
-        if self.likelihood not in {
-            "none", "gaussian", "studentt", "laplace", "quantile", "lognormal", "gamma", "negbinom"
-        }:
-            raise ValueError(f"Unknown likelihood: {self.likelihood}")
+        # linear skip (delta space)
+        self.enable_linear_skip = bool(cfg.enable_linear_skip)
+        if self.enable_linear_skip:
+            self.linear_skip = nn.Linear(self.L, self.O, bias=True)
+        else:
+            self.linear_skip = None
 
-        # ---- training loss config (internal) ----
-        self.compute_loss_in_forward = bool(cfg.compute_loss_in_forward)
-        self.point_loss = str(cfg.point_loss).lower()
+        # loss
+        self.point_loss = cfg.point_loss.lower()
         self.huber_delta = float(cfg.huber_delta)
         self.lambda_point = float(cfg.lambda_point)
         self.lambda_nll = float(cfg.lambda_nll)
-        self.loss_eps = float(cfg.loss_eps)
-        self.loss_check_domain = bool(cfg.loss_check_domain)
+        self.compute_loss_in_forward = bool(cfg.compute_loss_in_forward)
 
-        self.reg_weights = RegWeights(
-            reg_graph_orth=float(cfg.reg_graph_orth),
-            reg_graph_l1=float(cfg.reg_graph_l1),
-            reg_graph_scale_smooth=float(cfg.reg_graph_scale_smooth),
-            reg_fusion_l1=float(cfg.reg_fusion_l1),
-        )
-
-        # output controls
-        self.return_distribution = bool(cfg.return_distribution)
+        # outputs
         self.return_interpretation = bool(cfg.return_interpretation)
         self.return_components = bool(cfg.return_components)
+
+        # cached indices
+        self.register_buffer("_node_idx", torch.arange(self.N, dtype=torch.long), persistent=False)
+        self.register_buffer("_step_idx", torch.arange(self.O, dtype=torch.long), persistent=False)
+
+    def _select_tap(self, H_layers: torch.Tensor) -> torch.Tensor:
+        # H_layers: [Llayers,B,N,D]
+        Llayers = H_layers.size(0)
+        k = int(self.cfg.backbone_tap_layer)
+        if k < 0:
+            k = Llayers + k
+        k = max(0, min(Llayers - 1, k))
+        return H_layers[k]  # [B,N,D]
+
+    def _build_decoder_input(self, F: torch.Tensor, ts_out: Optional[torch.Tensor]) -> torch.Tensor:
+        # F: [B,O,N,D]
+        Bsz, O, N, D = F.shape
+
+        parts = [F]
+
+        if self.step_emb is not None:
+            se = self.drop(self.step_emb(self._step_idx))  # [O,S]
+            se = se.unsqueeze(0).unsqueeze(2).expand(Bsz, O, N, -1)
+            parts.append(se)
+
+        if self.node_emb is not None:
+            ne = self.drop(self.node_emb(self._node_idx))  # [N,E]
+            ne = ne.unsqueeze(0).unsqueeze(1).expand(Bsz, O, N, -1)
+            parts.append(ne)
+
+        if self.decoder_use_ts_out:
+            if ts_out is None:
+                raise ValueError("decoder_use_output_timestamps=True but targets_timestamps is None.")
+            ts = ts_out.float().unsqueeze(2).expand(Bsz, O, N, -1)
+            parts.append(ts)
+
+        return torch.cat(parts, dim=-1)
+
+    def _compute_point_loss(self, pred: torch.Tensor, true: torch.Tensor, mask: Optional[torch.Tensor]) -> torch.Tensor:
+        if self.point_loss == "mae":
+            return masked_mae(pred, true, mask)
+        elif self.point_loss == "mse":
+            return masked_mse(pred, true, mask)
+        elif self.point_loss == "huber":
+            return masked_huber(pred, true, mask, delta=self.huber_delta)
+        else:
+            raise ValueError(f"Unknown point_loss: {self.point_loss}")
 
     def forward(
         self,
@@ -1064,264 +635,148 @@ class MyModel(nn.Module):
         step: Optional[int] = None,
         epoch: Optional[int] = None,
     ) -> Dict:
-        if inputs.ndim != 3:
-            raise ValueError(f"Expected inputs [B,L,N], got {tuple(inputs.shape)}")
-        B, L, N = inputs.shape
+        """
+        Required return:
+          - prediction: [B,O,N]
+          - loss: scalar, if targets provided and compute_loss_in_forward=True
+        """
+        Bsz, L, N = inputs.shape
         if L != self.L or N != self.N:
-            raise ValueError(f"Input shape mismatch: got L={L},N={N}, expected L={self.L},N={self.N}")
+            raise ValueError(f"inputs must be [B,{self.L},{self.N}], got {tuple(inputs.shape)}")
 
-        # node/step embeddings on correct device
-        node_emb = None
-        if self.node_emb is not None:
-            node_ids = torch.arange(self.N, device=inputs.device)
-            node_emb = self.node_emb_drop(self.node_emb(node_ids))  # [N,E]
+        # timestamps requirement
+        if (self.enable_time or (self.enable_spatial and self.cfg.spatial_use_output_timestamps) or self.decoder_use_ts_out) and (targets_timestamps is None):
+            raise ValueError("targets_timestamps is required by current configuration.")
 
-        step_emb = None
-        if self.step_emb is not None:
-            step_ids = torch.arange(self.O, device=inputs.device)
-            step_emb = self.step_emb(step_ids)  # [O,S]
-
-        # (1) last-value centering
+        # center (delta)
         if self.last_value_centering:
-            last = inputs[:, -1, :]                 # [B,N]
-            x0 = inputs - last.unsqueeze(1)         # [B,L,N]
+            last = inputs[:, -1, :]           # [B,N]
+            x0 = inputs - last.unsqueeze(1)   # [B,L,N]
         else:
             last = None
             x0 = inputs
 
-        x0 = self.dropout(x0)
+        # node embedding for backbone input
+        node_feat = None
+        if self.node_emb is not None:
+            node_feat = self.drop(self.node_emb(self._node_idx))  # [N,E]
 
-        # (2) trunk backbone -> H [B,N,D]
-        ts_in = inputs_timestamps if bool(self.cfg.use_input_timestamps) else None
-        H = self.backbone(x0, ts_in, node_emb=node_emb if self.node_emb_in_backbone else None)
+        # backbone
+        H_layers = self.backbone(x0, inputs_timestamps, node_feat)   # [Llayers,B,N,D]
+        H = self._select_tap(H_layers)                               # [B,N,D]
 
-        O = self.O
-        H_base = H.unsqueeze(1).expand(-1, O, -1, -1)  # [B,O,N,D]
+        # step embedding for branches
+        step_feat = None
+        if self.step_emb is not None:
+            se = self.drop(self.step_emb(self._step_idx))            # [O,S]
+            step_feat = se.unsqueeze(0).expand(Bsz, -1, -1)          # [B,O,S]
 
-        # (3) spatial module
-        graph_info: Dict[str, torch.Tensor] = {}
-        if self.graph is not None:
-            H_graph, graph_info = self.graph(H, ts_out=targets_timestamps, O=O, step_emb=step_emb if self.step_emb_in_graph else None)
-        else:
-            H_graph = H_base
+        H_base = H.unsqueeze(1).expand(-1, self.O, -1, -1)           # [B,O,N,D]
 
-        # (4) fusion weights and fused features
-        if self.graph is not None:
-            if self.fusion_mode == "dynamic_per_horizon":
-                fw = self.fusion(H, targets_timestamps, step_emb=step_emb if (self.step_emb is not None) else None)
-            else:
-                fw = self.fusion()
-            w_base_raw, w_graph_raw = fw["w_base"], fw["w_graph"]
-        else:
-            w_base_raw = H.new_tensor(1.0)
-            w_graph_raw = H.new_tensor(0.0)
-            fw = {"w_base": w_base_raw, "w_graph": w_graph_raw}
+        # spatial branch
+        spatial_info: Dict[str, torch.Tensor] = {}
+        H_spatial = H_base
+        if self.spatial is not None:
+            ts_for_spatial = targets_timestamps if self.cfg.spatial_use_output_timestamps else None
+            H_spatial, spatial_info = self.spatial(H, ts_for_spatial, step_feat)
 
-        w_base = _expand_weight(w_base_raw, B, O, N, H.shape[-1])   # [B,O,N,1]
-        w_graph = _expand_weight(w_graph_raw, B, O, N, H.shape[-1]) # [B,O,N,1]
-
-        F = w_base * H_base + w_graph * H_graph  # [B,O,N,D]
-
-        # (5) decoder input augmentation
-        F_dec = _augment_decoder_features(
-            F,
-            node_emb=node_emb,
-            step_emb=step_emb,
-            ts_out=targets_timestamps if self.decoder_use_ts else None,
-            use_node=(self.node_emb is not None and self.node_emb_in_decoder),
-            use_step=(self.step_emb is not None and self.step_emb_in_decoder),
-            use_ts=self.decoder_use_ts,
-        )
-
-        mu_feat = self.mu_head(F_dec).squeeze(-1)  # [B,O,N]
-
-        # optional decomposition (compute only if user asks)
-        mu_base = None
-        mu_graph = None
-        if self.return_components or self.return_interpretation:
-            Hb_dec = _augment_decoder_features(
-                H_base,
-                node_emb=node_emb,
-                step_emb=step_emb,
-                ts_out=targets_timestamps if self.decoder_use_ts else None,
-                use_node=(self.node_emb is not None and self.node_emb_in_decoder),
-                use_step=(self.step_emb is not None and self.step_emb_in_decoder),
-                use_ts=self.decoder_use_ts,
-            )
-            Hg_dec = _augment_decoder_features(
-                H_graph,
-                node_emb=node_emb,
-                step_emb=step_emb,
-                ts_out=targets_timestamps if self.decoder_use_ts else None,
-                use_node=(self.node_emb is not None and self.node_emb_in_decoder),
-                use_step=(self.step_emb is not None and self.step_emb_in_decoder),
-                use_ts=self.decoder_use_ts,
-            )
-            mu_base = self.mu_head(Hb_dec).squeeze(-1)
-            mu_graph = self.mu_head(Hg_dec).squeeze(-1)
-
-        # (6) additive time effect
+        # time branch
         time_info: Dict[str, torch.Tensor] = {}
-        if self.time_effect is not None:
-            if targets_timestamps is None:
-                raise ValueError("enable_time_effect=True but targets_timestamps is None.")
-            time_total, time_info = self.time_effect(
-                H,
-                targets_timestamps,
-                node_emb=node_emb if self.node_emb_dim > 0 else None,
-                step_emb=step_emb if (self.step_emb_in_time and self.step_emb_dim > 0) else None,
-            )
-            mu_delta = mu_feat + time_total
-        else:
-            mu_delta = mu_feat
+        H_time = H_base
+        if self.time is not None:
+            H_time, time_info = self.time(H, targets_timestamps, step_feat)
 
+        # convex fusion
+        w0, ws, wt = self.fusion()
+        F = w0 * H_base + ws * H_spatial + wt * H_time               # [B,O,N,D]
+
+        # decode
+        dec_in = self._build_decoder_input(F, targets_timestamps if self.decoder_use_ts_out else None)
+        mu_delta = self.mu_head(dec_in)                              # [B,O,N]
+
+        # linear skip in delta space
+        if self.linear_skip is not None:
+            lin = self.linear_skip(x0.permute(0, 2, 1))              # [B,N,O]
+            mu_delta = mu_delta + lin.permute(0, 2, 1)
+
+        # restore level
         mu = mu_delta
-
-        # node bias (optional)
-        if self.node_bias is not None:
-            mu = mu + self.node_bias.view(1, 1, -1).to(mu.dtype)
-
-        # restore last value if using delta-style
         if last is not None:
-            mu = mu + last.unsqueeze(1).expand(-1, O, -1)
+            mu = mu + last.unsqueeze(1)
 
-        # (7) distribution parameters (decoded from F_dec)
-        dist = self.likelihood
+        out: Dict = {"prediction": mu}
+
+        # distribution params
         dist_params: Dict[str, torch.Tensor] = {}
-        prediction = mu
-
-        if dist in {"gaussian", "studentt", "laplace", "lognormal", "gamma", "negbinom"}:
-            log_s = self.scale_head(F_dec).squeeze(-1)  # [B,O,N]
-            scale = torch.nn.functional.softplus(log_s) + self.min_scale
-
-            if dist in {"gaussian", "studentt", "laplace"}:
-                dist_params = {"mu": mu, "scale": scale}
-                if dist == "studentt":
-                    if hasattr(self, "_studentt_df_fixed"):
-                        df = self._studentt_df_fixed.to(mu.device).to(mu.dtype)
-                    else:
-                        df = self.studentt_df_min + torch.nn.functional.softplus(self.studentt_df_param)
-                        df = df.to(mu.device).to(mu.dtype)
-                    dist_params["df"] = df
-                prediction = mu
-
-            elif dist == "lognormal":
-                dist_params = {"mu": mu, "scale": scale}
-                prediction = torch.exp(mu + 0.5 * scale ** 2)
-
-            elif dist == "gamma":
-                mu_pos = torch.nn.functional.softplus(mu) + 1e-6
-                shape = torch.nn.functional.softplus(scale) + 1e-6
-                dist_params = {"mu_pos": mu_pos, "shape": shape}
-                prediction = mu_pos
-
-            else:  # negbinom
-                mu_pos = torch.nn.functional.softplus(mu) + 1e-6
-                total_count = torch.nn.functional.softplus(scale) + 1e-6
-                dist_params = {"mu_pos": mu_pos, "total_count": total_count}
-                prediction = mu_pos
-
-        elif dist == "quantile":
-            Q = int(self.q_levels.numel())
-            if self.quantile_monotone:
-                q0 = self.q0_head(F_dec).squeeze(-1)
-                d = self.qdelta_head(F_dec)
-                d = torch.nn.functional.softplus(d)
-                qs = [q0.unsqueeze(-1)]
-                q_prev = q0
-                for i in range(Q - 1):
-                    q_prev = q_prev + d[..., i]
-                    qs.append(q_prev.unsqueeze(-1))
-                q_all = torch.cat(qs, dim=-1)
-            else:
-                q_all = self.qall_head(F_dec)
-
-            dist_params = {"quantiles": q_all, "q_levels": self.q_levels.to(device=mu.device, dtype=mu.dtype)}
-
-            idx = int(torch.argmin(torch.abs(self.q_levels.to(mu.device) - self.quantile_pred_level)).item())
-            prediction = q_all[..., idx]
-
-            if (not self.quantile_monotone) and self.quantile_crossing_penalty > 0:
-                diffs = q_all[..., 1:] - q_all[..., :-1]
-                dist_params["cross_penalty"] = self.quantile_crossing_penalty * torch.relu(-diffs).mean()
-
-        elif dist == "none":
-            prediction = mu
-        else:
-            raise ValueError(f"Unknown likelihood: {dist}")
-
-        # (8) output dict
-        out: Dict = {"prediction": prediction}
-
-        if self.return_distribution and dist != "none":
-            out["dist_name"] = dist
+        if self.likelihood in ("gaussian", "studentt"):
+            raw_scale = self.scale_head(dec_in).squeeze(-1)          # [B,O,N]
+            scale = torch.nn.functional.softplus(raw_scale) + self.min_scale
+            dist_params["scale"] = scale
+            if self.likelihood == "studentt":
+                df = torch.nn.functional.softplus(self.df_raw) + self.studentt_df_min
+                dist_params["df"] = df
+            out["dist_name"] = self.likelihood
             out["dist_params"] = dist_params
+        elif self.likelihood == "quantile":
+            q_raw = self.quantile_head(dec_in)                       # [B,O,N,Q]
+            out["dist_name"] = "quantile"
+            out["dist_params"] = {"quantiles": q_raw, "levels": torch.tensor(self.quantile_levels, device=mu.device)}
+        else:
+            out["dist_name"] = "none"
 
-        if self.return_interpretation:
-            # store raw fusion weights (not expanded)
-            out["fusion_weights"] = {"w_base": w_base_raw.detach(), "w_graph": w_graph_raw.detach()}
-            if self.graph is not None:
-                out.update(graph_info)
-            if self.time_effect is not None:
-                out.update(time_info)
-
+        # optional components / interpretation
         if self.return_components:
-            comps: Dict[str, torch.Tensor] = {
-                "w_base": w_base_raw.detach(),
-                "w_graph": w_graph_raw.detach(),
-                "mu": mu,
+            out["components"] = {
+                "w_base": w0.detach(),
+                "w_spatial": ws.detach(),
+                "w_time": wt.detach(),
             }
-            if mu_base is not None:
-                comps["mu_base"] = mu_base + (last.unsqueeze(1) if last is not None else 0.0)
-            if mu_graph is not None:
-                comps["mu_graph"] = mu_graph + (last.unsqueeze(1) if last is not None else 0.0)
-            comps["mu_feat"] = mu_feat + (last.unsqueeze(1) if last is not None else 0.0)
-            if self.time_effect is not None:
-                comps["time_tod"] = time_info.get("time_tod")
-                comps["time_dow"] = time_info.get("time_dow")
-                comps["time_total"] = time_info.get("time_total")
-            if last is not None:
-                comps["last_value"] = last
-            if self.node_bias is not None:
-                comps["node_bias"] = self.node_bias.detach()
-            out["components"] = comps
+        if self.return_interpretation:
+            # for paper: show spectral token attention weights and low-rank graph modes
+            out["interpretation"] = {
+                "fusion_weights": torch.stack([w0.detach(), ws.detach(), wt.detach()]),
+                **{k: v.detach() for k, v in spatial_info.items()},
+                # to avoid huge memory, we provide mean over nodes for time attention
+                "time_attn_mean_over_nodes": (time_info["time_attn"].detach().mean(dim=2) if "time_attn" in time_info else None),
+                "time_gate": (time_info["time_gate"].detach() if "time_gate" in time_info else None),
+            }
 
-        # (9) loss inside forward (runner compatibility)
-        if self.compute_loss_in_forward and (targets is not None) and (targets.numel() > 0):
-            loss_inputs: Dict = {"prediction": prediction}
-            if dist != "none":
-                loss_inputs["dist_name"] = dist
-                loss_inputs["dist_params"] = dist_params
+        # loss inside forward (runner compatibility)
+        if self.compute_loss_in_forward and (targets is not None):
+            # point loss
+            loss_point = self._compute_point_loss(mu, targets, targets_mask)
+            loss = self.lambda_point * loss_point
 
-            # regularization signals
-            loss_inputs["fusion_weights"] = {"w_base": w_base_raw, "w_graph": w_graph_raw}
-            if self.graph is not None:
-                # support both symmetric and directed graph variants
-                if "graph_basis" in graph_info:
-                    # symmetric PSD kernel
-                    loss_inputs["graph_basis"] = graph_info["graph_basis"]
-                else:
-                    # directed kernel: P/Q bases
-                    if "graph_left_basis" in graph_info:
-                        loss_inputs["graph_left_basis"] = graph_info["graph_left_basis"]
-                    if "graph_right_basis" in graph_info:
-                        loss_inputs["graph_right_basis"] = graph_info["graph_right_basis"]
+            # nll
+            loss_nll = mu.new_zeros(())
+            if self.likelihood == "gaussian":
+                nll = gaussian_nll(targets, mu, dist_params["scale"])
+                loss_nll = masked_mean(nll, targets_mask)
+                loss = loss + self.lambda_nll * loss_nll
+            elif self.likelihood == "studentt":
+                nll = studentt_nll(targets, mu, dist_params["scale"], dist_params["df"])
+                loss_nll = masked_mean(nll, targets_mask)
+                loss = loss + self.lambda_nll * loss_nll
+            elif self.likelihood == "quantile":
+                q_raw = out["dist_params"]["quantiles"]  # [B,O,N,Q]
+                levels = self.quantile_levels
+                # sum pinball losses for all quantiles
+                q_losses = []
+                for i, q in enumerate(levels):
+                    q_losses.append(quantile_loss(targets, q_raw[..., i], float(q)))
+                q_loss = torch.stack(q_losses, dim=-1).mean(dim=-1)  # mean over Q
+                loss_nll = masked_mean(q_loss, targets_mask)
+                loss = loss + self.lambda_nll * loss_nll
 
-                if "graph_scales" in graph_info:
-                    loss_inputs["graph_scales"] = graph_info["graph_scales"]
+            # spatial regularization (orth)
+            loss_reg = mu.new_zeros(())
+            if self.spatial is not None:
+                loss_reg = loss_reg + self.spatial.orth_reg()
+            loss = loss + loss_reg
 
-            loss_dict = compute_total_loss(
-                outputs=loss_inputs,
-                targets=targets,
-                targets_mask=targets_mask,
-                point_loss=self.point_loss,
-                huber_delta=self.huber_delta,
-                lambda_point=self.lambda_point,
-                lambda_nll=self.lambda_nll,
-                reg_weights=self.reg_weights,
-                eps=self.loss_eps,
-                check_domain=self.loss_check_domain,
-            )
-            out.update(loss_dict)
+            out["loss"] = loss
+            out["loss_point"] = loss_point.detach()
+            out["loss_nll"] = loss_nll.detach()
+            out["loss_reg"] = loss_reg.detach()
 
         return out
