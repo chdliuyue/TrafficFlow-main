@@ -204,12 +204,25 @@ def build_backbone(cfg: MyModelConfig, L: int, N: int, T: int, in_extra: int) ->
 
 class SpatialLowRank(nn.Module):
     """A(b,o)=B diag(s) B^T, rank r, compute AH without N×N."""
-    def __init__(self, N: int, D: int, r: int, T: int, S: int, hidden: int, dropout: float, alpha: float, reg_orth: float):
+    def __init__(
+        self,
+        N: int,
+        D: int,
+        r: int,
+        T: int,
+        S: int,
+        hidden: int,
+        dropout: float,
+        alpha: float,
+        reg_orth: float,
+        normalize_basis: bool,
+    ):
         super().__init__()
         self.N, self.D, self.r = int(N), int(D), int(r)
         self.T, self.S = int(T), int(S)
         self.alpha = float(alpha)
         self.reg_orth = float(reg_orth)
+        self.normalize_basis = bool(normalize_basis)
 
         self.B = nn.Parameter(torch.empty(self.N, self.r))
         nn.init.xavier_uniform_(self.B)
@@ -225,6 +238,8 @@ class SpatialLowRank(nn.Module):
     def forward(self, H: torch.Tensor, ts_out: Optional[torch.Tensor], step_emb: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         Bsz, N, D = H.shape
         Bmat = self.B
+        if self.normalize_basis:
+            Bmat = torch.nn.functional.normalize(Bmat, dim=0)
 
         U = torch.einsum("bnd,nr->brd", H, Bmat)  # [B,r,D]
         ctx = torch.sqrt(torch.mean(U ** 2, dim=-1) + 1e-6)  # [B,r]
@@ -263,7 +278,19 @@ class SpatialLowRank(nn.Module):
 # ============================================================
 
 class SpectralTokenTimeAttention(nn.Module):
-    def __init__(self, D: int, S: int, K_tod: int, K_dow: int, attn_dim: int, alpha: float, gate_bound: float):
+    def __init__(
+        self,
+        D: int,
+        S: int,
+        K_tod: int,
+        K_dow: int,
+        attn_dim: int,
+        alpha: float,
+        gate_bound: float,
+        attn_dropout: float,
+        token_dropout: float,
+        attn_temperature: float,
+    ):
         super().__init__()
         self.D, self.S = int(D), int(S)
         self.K_tod, self.K_dow = int(K_tod), int(K_dow)
@@ -271,6 +298,7 @@ class SpectralTokenTimeAttention(nn.Module):
         self.attn_dim = int(attn_dim)
         self.alpha = float(alpha)
         self.gate_bound = float(gate_bound)
+        self.attn_temperature = float(attn_temperature)
 
         self.key_emb = nn.Embedding(self.M, self.attn_dim)
         self.val_emb = nn.Embedding(self.M, self.D)
@@ -278,6 +306,8 @@ class SpectralTokenTimeAttention(nn.Module):
         self.k_proj = nn.Linear(2, self.attn_dim, bias=False)
         self.g_proj = nn.Linear(2, 1, bias=True)
         self.q_proj = nn.Linear(self.D + self.S, self.attn_dim, bias=True)
+        self.attn_drop = nn.Dropout(float(attn_dropout))
+        self.token_drop = nn.Dropout(float(token_dropout))
 
     def forward(self, H: torch.Tensor, ts_out: torch.Tensor, step_emb: Optional[torch.Tensor]) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         Bsz, N, D = H.shape
@@ -296,6 +326,7 @@ class SpectralTokenTimeAttention(nn.Module):
         key = self.k_proj(tok) + self.key_emb(token_ids).view(1, 1, self.M, self.attn_dim)
         gate = torch.tanh(self.g_proj(tok)) * self.gate_bound
         val = gate * self.val_emb(token_ids).view(1, 1, self.M, self.D)
+        val = self.token_drop(val)
 
         H_rep = H.unsqueeze(1).expand(-1, O, -1, -1)
         if self.S > 0 and step_emb is not None:
@@ -305,8 +336,10 @@ class SpectralTokenTimeAttention(nn.Module):
             q_in = torch.cat([H_rep, H_rep.new_zeros((Bsz, O, N, 0))], dim=-1)
 
         q = self.q_proj(q_in)
-        logits = torch.einsum("bona,boma->bonm", q, key) / math.sqrt(float(self.attn_dim))
+        temp = max(self.attn_temperature, 1e-6)
+        logits = torch.einsum("bona,boma->bonm", q, key) / (math.sqrt(float(self.attn_dim)) * temp)
         attn = torch.softmax(logits, dim=-1)
+        attn = self.attn_drop(attn)
         delta = torch.einsum("bonm,bomd->bond", attn, val)
 
         H_time = H_rep + self.alpha * delta
@@ -337,6 +370,28 @@ class ConvexFusion3(nn.Module):
         w0 = 1.0 / denom
         ws = us / denom
         wt = ut / denom
+        return w0, ws, wt
+
+
+class AdaptiveFusion3(nn.Module):
+    def __init__(self, in_dim: int, hidden: int, dropout: float, raw_s_init: float, raw_t_init: float):
+        super().__init__()
+        hidden = int(hidden)
+        self.mlp = nn.Sequential(
+            nn.Linear(int(in_dim), hidden),
+            nn.GELU(),
+            nn.Dropout(float(dropout)),
+            nn.Linear(hidden, 3),
+        )
+        self.raw_s = nn.Parameter(torch.tensor(float(raw_s_init)))
+        self.raw_t = nn.Parameter(torch.tensor(float(raw_t_init)))
+
+    def forward(self, pooled: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        logits = self.mlp(pooled)
+        bias = torch.stack([logits.new_zeros(()), self.raw_s, self.raw_t])
+        logits = logits + bias.view(1, 1, 3)
+        weights = torch.softmax(logits, dim=-1)
+        w0, ws, wt = weights.unbind(dim=-1)
         return w0, ws, wt
 
 
@@ -418,6 +473,7 @@ class MyModel(nn.Module):
                 dropout=float(cfg.spatial_scale_dropout),
                 alpha=float(cfg.spatial_alpha),
                 reg_orth=float(cfg.reg_spatial_orth),
+                normalize_basis=bool(cfg.spatial_basis_normalize),
             )
 
         self.time = None
@@ -429,16 +485,30 @@ class MyModel(nn.Module):
                 attn_dim=int(cfg.time_attn_dim),
                 alpha=float(cfg.time_alpha),
                 gate_bound=float(cfg.time_gate_bound),
+                attn_dropout=float(cfg.time_attn_dropout),
+                token_dropout=float(cfg.time_token_dropout),
+                attn_temperature=float(cfg.time_attn_temperature),
             )
 
         self.enable_distribution = bool(cfg.enable_distribution)
 
         # fusion
-        self.fusion = ConvexFusion3(
-            raw_s_init=float(cfg.fusion_raw_spatial_init),
-            raw_t_init=float(cfg.fusion_raw_time_init),
-            learnable=bool(cfg.fusion_learnable),
-        )
+        self.fusion_mode = str(cfg.fusion_mode).lower()
+        if self.fusion_mode == "adaptive":
+            fusion_in = self.D + (self.step_emb_dim if bool(cfg.fusion_use_step_embedding) else 0)
+            self.fusion = AdaptiveFusion3(
+                in_dim=fusion_in,
+                hidden=int(cfg.fusion_hidden),
+                dropout=float(cfg.fusion_dropout),
+                raw_s_init=float(cfg.fusion_raw_spatial_init),
+                raw_t_init=float(cfg.fusion_raw_time_init),
+            )
+        else:
+            self.fusion = ConvexFusion3(
+                raw_s_init=float(cfg.fusion_raw_spatial_init),
+                raw_t_init=float(cfg.fusion_raw_time_init),
+                learnable=bool(cfg.fusion_learnable),
+            )
 
         # decoder conditioning
         self.decoder_use_ts_out = bool(cfg.decoder_use_output_timestamps)
@@ -493,6 +563,7 @@ class MyModel(nn.Module):
         self.huber_delta = float(cfg.huber_delta)
         self.lambda_point = float(cfg.lambda_point)
         self.lambda_nll = float(cfg.lambda_nll)
+        self.nll_warmup_steps = int(cfg.nll_warmup_steps)
         self.compute_loss_in_forward = bool(cfg.compute_loss_in_forward)
 
         # outputs
@@ -600,7 +671,16 @@ class MyModel(nn.Module):
             H_time, time_info = self.time(H, targets_timestamps, step_feat)
 
         # fusion
-        w0, ws, wt = self.fusion()
+        if self.fusion_mode == "adaptive":
+            pooled = H_base.mean(dim=2)
+            if bool(self.cfg.fusion_use_step_embedding) and (step_feat is not None):
+                pooled = torch.cat([pooled, step_feat], dim=-1)
+            w0, ws, wt = self.fusion(pooled)
+            w0 = w0.unsqueeze(-1).unsqueeze(-1)
+            ws = ws.unsqueeze(-1).unsqueeze(-1)
+            wt = wt.unsqueeze(-1).unsqueeze(-1)
+        else:
+            w0, ws, wt = self.fusion()
         F = w0 * H_base + ws * H_spatial + wt * H_time
 
         # decoder input
@@ -661,9 +741,18 @@ class MyModel(nn.Module):
 
             loss_nll = mu.new_zeros(())
             if self.enable_distribution and (self.lambda_nll > 0.0):
+                if self.nll_warmup_steps > 0:
+                    if step is not None:
+                        warm = min(float(step) / float(self.nll_warmup_steps), 1.0)
+                    elif epoch is not None:
+                        warm = min(float(epoch) / float(self.nll_warmup_steps), 1.0)
+                    else:
+                        warm = 1.0
+                else:
+                    warm = 1.0
                 nll = studentt_nll(targets, mu, scale, df)
                 loss_nll = masked_mean(nll, targets_mask)
-                loss = loss + self.lambda_nll * loss_nll
+                loss = loss + (self.lambda_nll * warm) * loss_nll
 
             loss_reg = mu.new_zeros(())
             if self.spatial is not None:

@@ -81,6 +81,7 @@ class MyModelConfig(BasicTSModelConfig):
     spatial_scale_dropout: float = field(default=0.1)
     reg_spatial_orth: float = field(default=1e-4)
     spatial_use_output_timestamps: bool = field(default=True)
+    spatial_basis_normalize: bool = field(default=True)
 
     # ============================================================
     # Ablation switch #2: Time branch
@@ -91,6 +92,9 @@ class MyModelConfig(BasicTSModelConfig):
     time_attn_dim: int = field(default=64)
     time_alpha: float = field(default=1.0)
     time_gate_bound: float = field(default=1.0)
+    time_attn_dropout: float = field(default=0.1)
+    time_token_dropout: float = field(default=0.1)
+    time_attn_temperature: float = field(default=1.0)
 
     # ============================================================
     # Convex fusion (stable): base + spatial + time
@@ -98,6 +102,10 @@ class MyModelConfig(BasicTSModelConfig):
     fusion_learnable: bool = field(default=True)
     fusion_raw_spatial_init: float = field(default=-1.0)
     fusion_raw_time_init: float = field(default=-1.0)
+    fusion_mode: str = field(default="adaptive", metadata={"help": "adaptive|global"})
+    fusion_hidden: int = field(default=128)
+    fusion_dropout: float = field(default=0.1)
+    fusion_use_step_embedding: bool = field(default=True)
 
     # ============================================================
     # Ablation switch #3: Distributional fitting (Student-t)
@@ -130,6 +138,7 @@ class MyModelConfig(BasicTSModelConfig):
 
     # NLL weight (effective only when enable_distribution=True)
     lambda_nll: float = field(default=0.02)
+    nll_warmup_steps: int = field(default=0)
 
     compute_loss_in_forward: bool = field(default=True)
 
