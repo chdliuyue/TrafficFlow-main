@@ -21,9 +21,9 @@ def main():
 
         # ---- backbone (best-like) ----
         backbone_type="gru",
-        backbone_hidden_size=320,
+        backbone_hidden_size=384,
         backbone_layers=3,
-        backbone_dropout=0.1,
+        backbone_dropout=0.15,
         backbone_tap_layer=-1,  # 你实验2更优：取最后层作为并行分支输入 H
         use_input_timestamps=False,  # 你实验更优：不把 ts_in 喂给 backbone
 
@@ -36,33 +36,41 @@ def main():
         # Innovation #1: Spatial (low-rank, avoid N×N)
         # ============================================================
         enable_spatial=True,
-        spatial_rank=64,
-        spatial_alpha=0.1,
-        spatial_scale_hidden=256,
+        spatial_rank=96,
+        spatial_alpha=0.2,
+        spatial_scale_hidden=320,
         spatial_scale_dropout=0.1,
         reg_spatial_orth=1e-4,
         spatial_use_output_timestamps=True,
+        spatial_basis_normalize=True,
 
         # ============================================================
         # Innovation #2: Time (Spectral-Token Attention)
         # ============================================================
         enable_time=True,
-        time_tod_harmonics=4,
-        time_dow_harmonics=2,
-        time_attn_dim=64,
-        time_alpha=1.0,
+        time_tod_harmonics=6,
+        time_dow_harmonics=3,
+        time_attn_dim=96,
+        time_alpha=1.2,
         time_gate_bound=1.0,
+        time_attn_dropout=0.1,
+        time_token_dropout=0.1,
+        time_attn_temperature=1.1,
 
         # ---- convex fusion ----
         fusion_learnable=True,
-        fusion_raw_spatial_init=-1.0,
-        fusion_raw_time_init=-1.0,
+        fusion_raw_spatial_init=-0.8,
+        fusion_raw_time_init=-0.8,
+        fusion_mode="adaptive",
+        fusion_hidden=128,
+        fusion_dropout=0.1,
+        fusion_use_step_embedding=True,
 
         # ============================================================
         # Innovation #3: Distribution fitting (Student-t)
         # ============================================================
         enable_distribution=True,  # ✅ 分布拟合消融开关
-        dist_trunk_hidden=256,
+        dist_trunk_hidden=320,
         dist_trunk_layers=2,
 
         min_scale=0.01,  # sigma 下界（数值稳定很关键）
@@ -76,10 +84,11 @@ def main():
         enable_linear_skip=True,
 
         # ---- loss (inside forward) ----
-        point_loss="mae",
-        huber_delta=1.0,
+        point_loss="huber",
+        huber_delta=1.5,
         lambda_point=1.0,
-        lambda_nll=0.02,  # 你实验2更优：NLL 权重小
+        lambda_nll=0.05,  # 你实验2更优：NLL 权重小
+        nll_warmup_steps=1000,
 
         compute_loss_in_forward=True,
 
@@ -98,7 +107,7 @@ def main():
         dataset_name="PEMS07",
         # loss="MAE",
         num_epochs=300,
-        callbacks=[EarlyStopping(30)],
+        callbacks=[GradientClipping(1.0), EarlyStopping(30)],
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
         # callbacks = [NoBP()], # HI
         gpus="0",
