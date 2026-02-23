@@ -268,9 +268,15 @@ class SpatialLowRank(nn.Module):
     def orth_reg(self) -> torch.Tensor:
         if self.reg_orth <= 0:
             return self.B.new_zeros(())
-        BtB = (self.B.t() @ self.B) / float(self.N)
-        I = torch.eye(self.r, device=self.B.device, dtype=self.B.dtype)
+        B = self.B
+        if self.normalize_basis:
+            B = torch.nn.functional.normalize(B, dim=0)
+            BtB = B.t() @ B                  # 不要 /N
+        else:
+            BtB = (B.t() @ B) / float(self.N)
+        I = torch.eye(self.r, device=B.device, dtype=B.dtype)
         return self.reg_orth * torch.mean((BtB - I) ** 2)
+
 
 
 # ============================================================
@@ -495,7 +501,7 @@ class MyModel(nn.Module):
         # fusion
         self.fusion_mode = str(cfg.fusion_mode).lower()
         if self.fusion_mode == "adaptive":
-            fusion_in = self.D + (self.step_emb_dim if bool(cfg.fusion_use_step_embedding) else 0)
+            fusion_in = 3 * self.D + (self.step_emb_dim if bool(cfg.fusion_use_step_embedding) else 0)
             self.fusion = AdaptiveFusion3(
                 in_dim=fusion_in,
                 hidden=int(cfg.fusion_hidden),
@@ -672,7 +678,7 @@ class MyModel(nn.Module):
 
         # fusion
         if self.fusion_mode == "adaptive":
-            pooled = H_base.mean(dim=2)
+            pooled = torch.cat([H_base.mean(dim=2), H_spatial.mean(dim=2), H_time.mean(dim=2)], dim=-1)
             if bool(self.cfg.fusion_use_step_embedding) and (step_feat is not None):
                 pooled = torch.cat([pooled, step_feat], dim=-1)
             w0, ws, wt = self.fusion(pooled)
@@ -734,6 +740,7 @@ class MyModel(nn.Module):
                 "time_gate": (time_info["time_gate"].detach() if "time_gate" in time_info else None),
             }
 
+        
         # loss inside forward
         if self.compute_loss_in_forward and (targets is not None):
             loss_point = self._compute_point_loss(mu, targets, targets_mask)
@@ -741,15 +748,30 @@ class MyModel(nn.Module):
 
             loss_nll = mu.new_zeros(())
             if self.enable_distribution and (self.lambda_nll > 0.0):
+                # ---- warmup factor (make train/val/test consistent) ----
                 if self.nll_warmup_steps > 0:
-                    if step is not None:
-                        warm = min(float(step) / float(self.nll_warmup_steps), 1.0)
-                    elif epoch is not None:
-                        warm = min(float(epoch) / float(self.nll_warmup_steps), 1.0)
+                    if self.training:
+                    # training: use provided step if available
+                        if step is None:
+                            # fallback to an internal counter if runner doesn't pass step
+                            self._warm_step = int(getattr(self, "_warm_step", 0) + 1)
+                            step_for_warm = float(self._warm_step)
+                        else:
+                            step_for_warm = float(step)
+                            # also keep an internal monotonic step (robust to runner resetting step)
+                            prev = int(getattr(self, "_warm_step", -1))
+                            cur = int(step_for_warm)
+                            self._warm_step = cur if cur > prev else (prev + 1)
+                            step_for_warm = float(self._warm_step)
+
+                        warm = min(step_for_warm / float(self.nll_warmup_steps), 1.0)
+                        self._cached_nll_warm = warm
                     else:
-                        warm = 1.0
+                        # eval: ignore runner's step (often not global), reuse cached warm
+                        warm = float(getattr(self, "_cached_nll_warm", 1.0))
                 else:
                     warm = 1.0
+
                 nll = studentt_nll(targets, mu, scale, df)
                 loss_nll = masked_mean(nll, targets_mask)
                 loss = loss + (self.lambda_nll * warm) * loss_nll
@@ -760,7 +782,7 @@ class MyModel(nn.Module):
 
             loss = loss + loss_reg
 
-            out["loss"] = loss
+            out["loss"] = loss if self.training else loss.detach()
             out["loss_point"] = loss_point.detach()
             out["loss_nll"] = loss_nll.detach()
             out["loss_reg"] = loss_reg.detach()

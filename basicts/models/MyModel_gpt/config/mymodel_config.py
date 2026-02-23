@@ -59,7 +59,7 @@ class MyModelConfig(BasicTSModelConfig):
     use_input_timestamps: bool = field(default=True)
 
     # transformer-only knobs
-    transformer_nhead: int = field(default=4)
+    transformer_nhead: int = field(default=8)
     transformer_ffn_ratio: float = field(default=4.0)
     transformer_norm_first: bool = field(default=True)
     transformer_use_positional_encoding: bool = field(default=True)
