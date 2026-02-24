@@ -119,6 +119,14 @@ class BasicTSRunner:
         self.eval_horizons = \
             [x - 1 for x in eval_horizons] if eval_horizons else None
         self.save_results = cfg.save_results
+        self._dist_scale_sum = 0.0
+        self._dist_scale_sq_sum = 0.0
+        self._dist_scale_count = 0
+        self._dist_df_sum = 0.0
+        self._dist_df_sq_sum = 0.0
+        self._dist_df_count = 0
+        self._fusion_component_sums = {"w_base": 0.0, "w_spatial": 0.0, "w_time": 0.0}
+        self._fusion_component_counts = {"w_base": 0, "w_spatial": 0, "w_time": 0}
 
         # define loss function
         if isinstance(cfg.loss, nn.Module):
@@ -637,6 +645,7 @@ class BasicTSRunner:
         # save results to self.ckpt_save_dir/test_results (in eval loop)
         if self.cfg.save_results:
             result_path = os.path.join(self.ckpt_save_dir, "test_results")
+            self._save_distribution_artifacts(result_path)
             self.logger.info(f"Test results saved to {result_path}.")
 
         # save metrics results to self.ckpt_save_dir/test_metrics.json
@@ -1087,6 +1096,8 @@ class BasicTSRunner:
                                     shape=(total_samples, *prediction.shape[1:]))
             self._targets_memmap = np.memmap(targets_path, dtype=targets.dtype, mode="w+",
                                 shape=(total_samples, *targets.shape[1:]))
+            self._dist_scale_memmap = None
+            self._dist_df_memmap = None
 
         start = batch_idx * inputs.shape[0]
         end = start + inputs.shape[0]
@@ -1098,6 +1109,100 @@ class BasicTSRunner:
             self._inputs_memmap.flush()
             self._prediction_memmap.flush()
             self._targets_memmap.flush()
+            if self._dist_scale_memmap is not None:
+                self._dist_scale_memmap.flush()
+            if self._dist_df_memmap is not None:
+                self._dist_df_memmap.flush()
+
+        # collect optional distribution and interpretation statistics from best model evaluation
+        if "dist_params" in batch_data and isinstance(batch_data["dist_params"], dict):
+            dist_params = batch_data["dist_params"]
+            if "scale" in dist_params and dist_params["scale"] is not None:
+                scale = dist_params["scale"].detach().cpu().numpy()
+                self._dist_scale_sum += float(scale.sum())
+                self._dist_scale_sq_sum += float((scale ** 2).sum())
+                self._dist_scale_count += int(scale.size)
+                scale_path = os.path.join(save_dir, "dist_scale.npy")
+                if self._dist_scale_memmap is None:
+                    self._dist_scale_memmap = np.memmap(scale_path, dtype=scale.dtype, mode="w+", shape=(total_samples, *scale.shape[1:]))
+                self._dist_scale_memmap[start:end] = scale
+            if "df" in dist_params and dist_params["df"] is not None:
+                df = dist_params["df"].detach().cpu().numpy()
+                self._dist_df_sum += float(df.sum())
+                self._dist_df_sq_sum += float((df ** 2).sum())
+                self._dist_df_count += int(df.size)
+                df_path = os.path.join(save_dir, "dist_df.npy")
+                if self._dist_df_memmap is None:
+                    self._dist_df_memmap = np.memmap(df_path, dtype=df.dtype, mode="w+", shape=(total_samples, *df.shape[1:]))
+                self._dist_df_memmap[start:end] = df
+
+        if "components" in batch_data and isinstance(batch_data["components"], dict):
+            components = batch_data["components"]
+            for key in ("w_base", "w_spatial", "w_time"):
+                if key in components and components[key] is not None:
+                    comp = components[key].detach().cpu().numpy()
+                    self._fusion_component_sums[key] += float(comp.sum())
+                    self._fusion_component_counts[key] += int(comp.size)
+
+
+    @master_only
+    def _save_distribution_artifacts(self, result_path: str) -> None:
+        """Save extra local artifacts for final best-model evaluation."""
+
+        os.makedirs(result_path, exist_ok=True)
+
+        def _safe_mean(sum_value: float, count: int) -> Optional[float]:
+            return (sum_value / count) if count > 0 else None
+
+        def _safe_std(sum_value: float, sq_sum_value: float, count: int) -> Optional[float]:
+            if count <= 0:
+                return None
+            mean = sum_value / count
+            var = max(sq_sum_value / count - mean * mean, 0.0)
+            return float(np.sqrt(var))
+
+        summary = {
+            "dist_name": getattr(self.cfg.model_config, "enable_distribution", False) and "studentt" or "none",
+            "scale": {
+                "mean": _safe_mean(self._dist_scale_sum, self._dist_scale_count),
+                "std": _safe_std(self._dist_scale_sum, self._dist_scale_sq_sum, self._dist_scale_count),
+                "count": self._dist_scale_count,
+            },
+            "df": {
+                "mean": _safe_mean(self._dist_df_sum, self._dist_df_count),
+                "std": _safe_std(self._dist_df_sum, self._dist_df_sq_sum, self._dist_df_count),
+                "count": self._dist_df_count,
+                "min": float(getattr(self.cfg.model_config, "studentt_df_min", np.nan)),
+                "max": float(getattr(self.cfg.model_config, "studentt_df_max", np.nan)),
+            },
+            "innovation": {
+                "enable_spatial": bool(getattr(self.cfg.model_config, "enable_spatial", False)),
+                "enable_time": bool(getattr(self.cfg.model_config, "enable_time", False)),
+                "enable_distribution": bool(getattr(self.cfg.model_config, "enable_distribution", False)),
+                "spatial_rank": getattr(self.cfg.model_config, "spatial_rank", None),
+                "time_tod_harmonics": getattr(self.cfg.model_config, "time_tod_harmonics", None),
+                "time_dow_harmonics": getattr(self.cfg.model_config, "time_dow_harmonics", None),
+                "studentt_df_mode": getattr(self.cfg.model_config, "studentt_df_mode", None),
+            },
+            "fusion_weight_mean": {
+                key: _safe_mean(self._fusion_component_sums[key], self._fusion_component_counts[key])
+                for key in self._fusion_component_sums
+            },
+        }
+
+        with open(os.path.join(result_path, "distribution_summary.json"), "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=4, ensure_ascii=False)
+
+        cfg_dump = {}
+        model_cfg = getattr(self.cfg, "model_config", None)
+        if model_cfg is not None:
+            for k, v in vars(model_cfg).items():
+                if isinstance(v, (str, int, float, bool)) or v is None:
+                    cfg_dump[k] = v
+                elif isinstance(v, (list, tuple)):
+                    cfg_dump[k] = list(v)
+        with open(os.path.join(result_path, "model_innovation_config.json"), "w", encoding="utf-8") as f:
+            json.dump(cfg_dump, f, indent=4, ensure_ascii=False)
 
     def init_logger(self, logger: logging.Logger = None, logger_name: str = None,
                     log_file_name: str = None, log_level: int = logging.INFO) -> None:

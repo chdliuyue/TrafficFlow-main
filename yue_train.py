@@ -93,8 +93,8 @@ def main():
         compute_loss_in_forward=True,
 
         # ---- outputs ----
-        return_interpretation=False,
-        return_components=False,
+        return_interpretation=True,
+        return_components=True,
 
     )
 
@@ -121,6 +121,7 @@ def main():
         test_data_prefetch=True,
         test_data_num_workers=2,
         test_data_pin_memory=True,
+        save_results=True,
     ))
 
 
