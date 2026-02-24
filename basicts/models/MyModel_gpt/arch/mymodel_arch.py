@@ -143,7 +143,7 @@ class TransformerBackbone(nn.Module):
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=self.D, nhead=int(nhead), dim_feedforward=dim_ff,
-                dropout=float(dropout), activation="gelu",
+                dropout=float(dropout), activation="relu",
                 batch_first=True, norm_first=bool(norm_first),
             )
             for _ in range(self.layers)
@@ -230,7 +230,7 @@ class SpatialLowRank(nn.Module):
         in_dim = self.r + self.T + self.S
         self.scale_mlp = nn.Sequential(
             nn.Linear(in_dim, int(hidden)),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(int(hidden), self.r),
         )
@@ -385,7 +385,7 @@ class AdaptiveFusion3(nn.Module):
         hidden = int(hidden)
         self.mlp = nn.Sequential(
             nn.Linear(int(in_dim), hidden),
-            nn.GELU(),
+            nn.ReLU(),
             nn.Dropout(float(dropout)),
             nn.Linear(hidden, 3),
         )
@@ -419,7 +419,7 @@ class DistTrunk(nn.Module):
         d = in_dim
         for _ in range(layers):
             blocks.append(nn.Linear(d, hidden))
-            blocks.append(nn.GELU())
+            blocks.append(nn.ReLU())
             blocks.append(nn.Dropout(float(dropout)))
             d = hidden
         self.net = nn.Sequential(*blocks)
@@ -541,20 +541,13 @@ class MyModel(nn.Module):
 
         self.min_scale = float(cfg.min_scale)
 
-        # df head / global df (only if distribution enabled)
-        self.df_mode = str(cfg.studentt_df_mode)
+        # df head (distribution parameter must be learned from features)
         self.df_min = float(cfg.studentt_df_min)
         self.df_max = float(cfg.studentt_df_max)
 
         if self.enable_distribution:
-            if self.df_mode == "learned_global":
-                self.df_raw_global = nn.Parameter(torch.tensor(float(cfg.studentt_df_init)))
-                self.df_head = None
-            else:
-                self.df_raw_global = None
-                self.df_head = LinearHead(trunk_dim, 1, bias_init=float(cfg.studentt_df_init))
+            self.df_head = LinearHead(trunk_dim, 1, bias_init=float(cfg.studentt_df_init))
         else:
-            self.df_raw_global = None
             self.df_head = None
 
         # linear skip (delta)
@@ -569,7 +562,7 @@ class MyModel(nn.Module):
         self.huber_delta = float(cfg.huber_delta)
         self.lambda_point = float(cfg.lambda_point)
         self.lambda_nll = float(cfg.lambda_nll)
-        self.nll_warmup_steps = int(cfg.nll_warmup_steps)
+        self.nll_total_epochs = int(cfg.nll_total_epochs)
         self.compute_loss_in_forward = bool(cfg.compute_loss_in_forward)
 
         # outputs
@@ -619,6 +612,39 @@ class MyModel(nn.Module):
             return masked_huber(pred, true, mask, delta=self.huber_delta)
         raise ValueError(f"Unknown point_loss: {self.point_loss}")
 
+    def _compute_nll_warm_factor(self, epoch: Optional[int]) -> float:
+        if self.nll_total_epochs <= 0:
+            return 1.0
+        if epoch is None:
+            return 1.0 if not self.training else 0.0
+        return min(max(float(epoch) / float(self.nll_total_epochs), 0.0), 1.0)
+
+    def _compute_loss_terms(
+        self,
+        mu: torch.Tensor,
+        targets: torch.Tensor,
+        targets_mask: Optional[torch.Tensor],
+        scale: Optional[torch.Tensor],
+        df: Optional[torch.Tensor],
+        epoch: Optional[int],
+    ) -> Dict[str, torch.Tensor]:
+        loss_point = self._compute_point_loss(mu, targets, targets_mask)
+        loss_nll = mu.new_zeros(())
+        if self.enable_distribution and (self.lambda_nll > 0.0):
+            warm = self._compute_nll_warm_factor(epoch)
+            nll = studentt_nll(targets, mu, scale, df)
+            loss_nll = masked_mean(nll, targets_mask)
+            weighted_nll = (self.lambda_nll * warm) * loss_nll
+        else:
+            weighted_nll = mu.new_zeros(())
+
+        loss_reg = mu.new_zeros(())
+        if self.spatial is not None:
+            loss_reg = self.spatial.orth_reg()
+
+        loss = self.lambda_point * loss_point + weighted_nll + loss_reg
+        return {"loss": loss, "loss_point": loss_point, "loss_nll": loss_nll, "loss_reg": loss_reg}
+
     def forward(
         self,
         inputs: torch.Tensor,
@@ -627,7 +653,6 @@ class MyModel(nn.Module):
         targets_timestamps: Optional[torch.Tensor] = None,
         targets_mask: Optional[torch.Tensor] = None,
         train: bool = False,
-        step: Optional[int] = None,
         epoch: Optional[int] = None,
     ) -> Dict:
         Bsz, L, N = inputs.shape
@@ -715,11 +740,8 @@ class MyModel(nn.Module):
             raw_scale = self.scale_head(Z).squeeze(-1)
             scale = torch.nn.functional.softplus(raw_scale) + self.min_scale
 
-            if self.df_raw_global is not None:
-                df = torch.nn.functional.softplus(self.df_raw_global) + self.df_min
-            else:
-                raw_df = self.df_head(Z).squeeze(-1)
-                df = torch.nn.functional.softplus(raw_df) + self.df_min
+            raw_df = self.df_head(Z).squeeze(-1)
+            df = torch.nn.functional.softplus(raw_df) + self.df_min
             df = torch.clamp(df, min=self.df_min, max=self.df_max)
 
             out["dist_name"] = "studentt"
@@ -741,50 +763,12 @@ class MyModel(nn.Module):
             }
 
         
-        # loss inside forward
+        # loss inside forward (delegated to dedicated helper)
         if self.compute_loss_in_forward and (targets is not None):
-            loss_point = self._compute_point_loss(mu, targets, targets_mask)
-            loss = self.lambda_point * loss_point
-
-            loss_nll = mu.new_zeros(())
-            if self.enable_distribution and (self.lambda_nll > 0.0):
-                # ---- warmup factor (make train/val/test consistent) ----
-                if self.nll_warmup_steps > 0:
-                    if self.training:
-                    # training: use provided step if available
-                        if step is None:
-                            # fallback to an internal counter if runner doesn't pass step
-                            self._warm_step = int(getattr(self, "_warm_step", 0) + 1)
-                            step_for_warm = float(self._warm_step)
-                        else:
-                            step_for_warm = float(step)
-                            # also keep an internal monotonic step (robust to runner resetting step)
-                            prev = int(getattr(self, "_warm_step", -1))
-                            cur = int(step_for_warm)
-                            self._warm_step = cur if cur > prev else (prev + 1)
-                            step_for_warm = float(self._warm_step)
-
-                        warm = min(step_for_warm / float(self.nll_warmup_steps), 1.0)
-                        self._cached_nll_warm = warm
-                    else:
-                        # eval: ignore runner's step (often not global), reuse cached warm
-                        warm = float(getattr(self, "_cached_nll_warm", 1.0))
-                else:
-                    warm = 1.0
-
-                nll = studentt_nll(targets, mu, scale, df)
-                loss_nll = masked_mean(nll, targets_mask)
-                loss = loss + (self.lambda_nll * warm) * loss_nll
-
-            loss_reg = mu.new_zeros(())
-            if self.spatial is not None:
-                loss_reg = loss_reg + self.spatial.orth_reg()
-
-            loss = loss + loss_reg
-
-            out["loss"] = loss if self.training else loss.detach()
-            out["loss_point"] = loss_point.detach()
-            out["loss_nll"] = loss_nll.detach()
-            out["loss_reg"] = loss_reg.detach()
+            loss_terms = self._compute_loss_terms(mu, targets, targets_mask, scale, df, epoch)
+            out["loss"] = loss_terms["loss"] if self.training else loss_terms["loss"].detach()
+            out["loss_point"] = loss_terms["loss_point"].detach()
+            out["loss_nll"] = loss_terms["loss_nll"].detach()
+            out["loss_reg"] = loss_terms["loss_reg"].detach()
 
         return out

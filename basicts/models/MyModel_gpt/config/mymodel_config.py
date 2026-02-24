@@ -117,8 +117,6 @@ class MyModelConfig(BasicTSModelConfig):
 
     min_scale: float = field(default=0.01)        # sigma floor for numeric stability
 
-    # df learning mode: "learned_from_features" (recommended) or "learned_global"
-    studentt_df_mode: str = field(default="learned_from_features")
     studentt_df_init: float = field(default=10.0)   # used as bias init
     studentt_df_min: float = field(default=2.1)
     studentt_df_max: float = field(default=60.0)
@@ -138,7 +136,7 @@ class MyModelConfig(BasicTSModelConfig):
 
     # NLL weight (effective only when enable_distribution=True)
     lambda_nll: float = field(default=0.02)
-    nll_warmup_steps: int = field(default=0)
+    nll_total_epochs: int = field(default=0)
 
     compute_loss_in_forward: bool = field(default=True)
 
