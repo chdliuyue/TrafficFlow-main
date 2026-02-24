@@ -5,6 +5,8 @@ from basicts.runners.callback import AddAuxiliaryLoss
 # from basicts.runners.callback import NoBP
 from basicts.models.MyModel_gpt import MyModel, MyModelConfig
 
+import torch
+torch.set_float32_matmul_precision('high')
 
 def main():
 
