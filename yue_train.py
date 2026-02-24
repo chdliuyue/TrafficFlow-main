@@ -18,14 +18,14 @@ def main():
 
         # ---- preprocessing ----
         last_value_centering=True,
-        dropout=0.0,
 
         # ---- backbone (best-like) ----
         backbone_type="gru", # gru transformer
         backbone_hidden_size=256, # 256
         backbone_layers=3, # 3
         backbone_dropout=0.0,
-        backbone_tap_layer=-1,  
+        backbone_tap_layer=-1,
+
         use_input_timestamps=False,  
 
         # ---- identity embeddings ----
@@ -55,12 +55,12 @@ def main():
         time_gate_bound=1.0,
         time_attn_dropout=0.0,
         time_token_dropout=0.0,
-        time_attn_temperature=1.1,
+        time_attn_temperature=1.0,
 
         # ---- convex fusion ----
         fusion_learnable=True,
-        fusion_raw_spatial_init=-0.8,
-        fusion_raw_time_init=-0.8,
+        fusion_raw_spatial_init=-1.0,
+        fusion_raw_time_init=-1.0,
         fusion_mode="adaptive",
         fusion_hidden=512, # 256
         fusion_dropout=0.0,
@@ -74,7 +74,6 @@ def main():
         dist_trunk_layers=3,
 
         min_scale=0.01,  # sigma 下界（数值稳定很关键）
-        studentt_df_mode="learned_global",  # df 由网络学习（b/o/n 可变）
         studentt_df_init=5.0,
         studentt_df_min=2.1,
         studentt_df_max=30.0,
@@ -88,7 +87,7 @@ def main():
         huber_delta=1.0,
         lambda_point=1.0,
         lambda_nll=1.0,
-        nll_warmup_steps=10000,
+        nll_total_epochs=300,
 
         compute_loss_in_forward=True,
 
