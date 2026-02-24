@@ -612,12 +612,14 @@ class MyModel(nn.Module):
             return masked_huber(pred, true, mask, delta=self.huber_delta)
         raise ValueError(f"Unknown point_loss: {self.point_loss}")
 
-    def _compute_nll_warm_factor(self, epoch: Optional[int]) -> float:
+    def _compute_nll_warm_factor(self, epoch: Optional[int]) -> torch.Tensor:
         if self.nll_total_epochs <= 0:
-            return 1.0
+            return torch.tensor(1.0, device=self._node_idx.device)
         if epoch is None:
-            return 1.0 if not self.training else 0.0
-        return min(max(float(epoch) / float(self.nll_total_epochs), 0.0), 1.0)
+            val = 1.0 if not self.training else 0.0
+            return torch.tensor(val, device=self._node_idx.device)
+        epoch_tensor = epoch if torch.is_tensor(epoch) else torch.tensor(epoch, device=self._node_idx.device)
+        return torch.clamp(epoch_tensor.float() / float(self.nll_total_epochs), 0.0, 1.0)
 
     def _compute_loss_terms(
         self,
