@@ -787,7 +787,7 @@ class BasicTSRunner:
         if "step" in self.forward_params:
             kwargs["step"] = step
         if "epoch" in self.forward_params:
-            kwargs["epoch"] = epoch
+            kwargs["epoch"] = None if epoch is None else torch.tensor(epoch, device=inputs.device)
         if "train" in self.forward_params:
             kwargs["train"] = self.status == RunnerStatus.TRAINING
 
