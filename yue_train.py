@@ -105,11 +105,7 @@ def main():
         model_config=model_config,
         dataset_name="PEMS07",
         # A100 40G profile: higher throughput + stable convergence.
-        model_dtype="bfloat16",
         compile_model=True,
-        train_batch_size=128,
-        val_batch_size=128,
-        test_batch_size=128,
         optimizer_params={"lr": 3e-4, "weight_decay": 1e-4},
         num_epochs=500,
         callbacks=[GradientClipping(1.0), EarlyStopping(30)],
