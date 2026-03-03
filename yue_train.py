@@ -29,6 +29,7 @@ def main():
         backbone_tap_layer=-1,
 
         use_input_timestamps=False,  
+        dropout=0.1,
 
         # ---- identity embeddings ----
         node_emb_dim=128, # 64
@@ -41,8 +42,8 @@ def main():
         spatial_rank=96,
         spatial_alpha=0.1,
         spatial_scale_hidden=256, # 256
-        spatial_scale_dropout=0.0,
-        reg_spatial_orth=1e-4,
+        spatial_scale_dropout=0.05,
+        reg_spatial_orth=2.2e-4,
         spatial_use_output_timestamps=True,
         spatial_basis_normalize=True,
 
@@ -53,7 +54,7 @@ def main():
         time_tod_harmonics=6,
         time_dow_harmonics=3,
         time_attn_dim=128, # 96
-        time_alpha=1.0,
+        time_alpha=0.95,
         time_gate_bound=1.0,
         time_attn_dropout=0.0,
         time_token_dropout=0.0,
@@ -61,8 +62,8 @@ def main():
 
         # ---- convex fusion ----
         fusion_learnable=True,
-        fusion_raw_spatial_init=-1.0,
-        fusion_raw_time_init=-1.0,
+        fusion_raw_spatial_init=-1.05,
+        fusion_raw_time_init=-1.05,
         fusion_mode="adaptive",
         fusion_hidden=512, # 256
         fusion_dropout=0.0,
@@ -75,10 +76,10 @@ def main():
         dist_trunk_hidden=512,
         dist_trunk_layers=3,
 
-        min_scale=0.01,  # sigma 下界（数值稳定很关键）
-        studentt_df_init=5.0,
+        min_scale=0.015,  # sigma 下界（数值稳定很关键）
+        studentt_df_init=6.0,
         studentt_df_min=2.1,
-        studentt_df_max=30.0,
+        studentt_df_max=22.0,
 
         # ---- decoder conditioning ----
         decoder_use_output_timestamps=True,
@@ -88,8 +89,8 @@ def main():
         point_loss="mae",
         huber_delta=1.0,
         lambda_point=1.0,
-        lambda_nll=1.0,
-        nll_total_epochs=300,
+        lambda_nll=0.95,
+        nll_total_epochs=220,
 
         compute_loss_in_forward=True,
 
@@ -108,21 +109,21 @@ def main():
         dataset_name="PEMS07",
         # A100 40G profile: higher throughput + stable convergence.
         compile_model=True,
-        optimizer_params={"lr": 3e-4, "weight_decay": 1e-4},
+        optimizer_params={"lr": 2e-4, "weight_decay": 1e-4},
         num_epochs=500,
-        callbacks=[GradientClipping(1.0), EarlyStopping(30)],
+        callbacks=[GradientClipping(1.0), EarlyStopping(50)],
         # callbacks=[AddAuxiliaryLoss(["aux_loss"])], # DUTE
         # callbacks = [NoBP()], # HI
         gpus="0",
         tf32=True,
         train_data_prefetch=True,
-        train_data_num_workers=8,
+        train_data_num_workers=4,
         train_data_pin_memory=True,
         val_data_prefetch=True,
-        val_data_num_workers=4,
+        val_data_num_workers=2,
         val_data_pin_memory=True,
         test_data_prefetch=True,
-        test_data_num_workers=4,
+        test_data_num_workers=2,
         test_data_pin_memory=True,
         save_results=True,
     ))
